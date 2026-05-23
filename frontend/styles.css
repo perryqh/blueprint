@@ -1294,3 +1294,101 @@ dialog.shortcuts-dialog button {
   font-family: inherit;
   cursor: pointer;
 }
+
+/* ============================================================
+   Brand mark — Gemini logo crops + blueprint-grid backdrop
+   ============================================================ */
+
+/* CSS-driven blueprint-grid lines. Two intensities so the mark sits on a
+ * stronger grid; surrounding empty states / landing wallpapers use the
+ * fainter --grid-line. */
+:root {
+  --grid-line:         rgba(56, 189, 248, 0.10);
+  --grid-line-strong:  rgba(56, 189, 248, 0.22);
+}
+:root[data-theme="dark"] {
+  --grid-line:         rgba(56, 189, 248, 0.20);
+  --grid-line-strong:  rgba(56, 189, 248, 0.42);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --grid-line:        rgba(56, 189, 248, 0.20);
+    --grid-line-strong: rgba(56, 189, 248, 0.42);
+  }
+}
+
+/* Landing hero — the full Gemini card sits on a CSS-rendered grid backdrop
+ * so the surrounding "page" reads as continuous with the card's own grid. */
+.hero-grid {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto var(--space-6);
+  padding: var(--space-6);
+  width: 384px;
+  max-width: 100%;
+  border-radius: var(--radius-lg);
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.hero-logo {
+  display: block;
+  width: 320px;
+  height: auto;
+  max-width: 100%;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+}
+
+/* Topbar mark — sits to the left of the "blueprint" wordmark text. */
+.home {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  text-decoration: none;
+}
+.home-mark {
+  display: block;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  /* Pull the brightness slightly so the mark reads in both light and dark
+   * topbars without a harsh contrast jump. */
+  opacity: 0.95;
+}
+
+/* a11y helper — keep the h1 for screen readers / search engines but
+ * remove it from the visual flow when the hero image carries the brand. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ✦ accent — the small sparkle the Gemini brand uses. Standalone
+ * decorative element; takes its color from the surrounding flow via
+ * currentColor so it tints with whatever container drives it. */
+.sparkle {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  fill: currentColor;
+  vertical-align: -0.125em;
+}
+.sparkle--spin {
+  animation: ps-sparkle-spin 2.4s linear infinite;
+  transform-origin: 50% 50%;
+}
+@keyframes ps-sparkle-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}

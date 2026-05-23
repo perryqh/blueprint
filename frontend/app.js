@@ -1029,10 +1029,17 @@ function renderComment(c, replies, byParent) {
       const msg = document.createElement('span');
       msg.innerHTML = `<strong>${escapeHtml(c.processing_by)}</strong> is replying`;
       working.appendChild(msg);
-      const dots = document.createElement('span');
-      dots.className = 'dots-pulse';
-      dots.innerHTML = '<span></span><span></span><span></span>';
-      working.appendChild(dots);
+      // ✦ accent — matches the Gemini brand sparkle; slowly rotates to read
+      // as "in progress" without the dot-pulse rhythm fighting the rest of
+      // the UI. SVG inline so it inherits color from the working-indicator.
+      const sparkle = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      sparkle.setAttribute('class', 'sparkle sparkle--spin');
+      sparkle.setAttribute('viewBox', '0 0 24 24');
+      sparkle.setAttribute('aria-hidden', 'true');
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', 'M 12 2 L 13.5 10.5 L 22 12 L 13.5 13.5 L 12 22 L 10.5 13.5 L 2 12 L 10.5 10.5 Z');
+      sparkle.appendChild(path);
+      working.appendChild(sparkle);
       wrap.appendChild(working);
     }
   }

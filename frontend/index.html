@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <title>blueprint</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
+  <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">
   <script>
     try {
       var t = localStorage.getItem('blueprint:theme');
@@ -13,7 +15,11 @@
 </head>
 <body class="landing">
   <main class="landing-main">
-    <h1>blueprint</h1>
+    <div class="hero-grid">
+      <img class="hero-logo" src="/static/img/blueprint-card.png"
+           alt="blueprint — agentic plans" width="320" height="384">
+    </div>
+    <h1 class="visually-hidden">blueprint</h1>
     <p class="landing-tag">Share interactive HTML blueprints with inline anchored comments.</p>
     <p class="landing-help">Publish a blueprint from the CLI:</p>
     <pre><code>blueprint publish path/to/blueprint.html</code></pre>
