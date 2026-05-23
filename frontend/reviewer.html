@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>blueprint · review</title>
+  <script>
+    // Set theme before CSS parses to avoid a light flash on dark-mode boot.
+    try {
+      var t = localStorage.getItem('blueprint:theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="reviewer">
+  <header class="topbar">
+    <div class="left">
+      <a class="home" href="/">blueprint</a>
+      <span class="slug" id="slug-display"></span>
+    </div>
+    <div class="right">
+      <input id="author" placeholder="your name" autocomplete="name">
+      <div id="auth-chip" class="auth-chip" hidden></div>
+      <div class="theme-toggle" role="radiogroup" aria-label="Theme">
+        <button type="button" data-theme-value="system" aria-checked="true" aria-label="System theme">Sys</button>
+        <button type="button" data-theme-value="light" aria-checked="false" aria-label="Light theme">Light</button>
+        <button type="button" data-theme-value="dark" aria-checked="false" aria-label="Dark theme">Dark</button>
+      </div>
+      <button type="button" id="help-btn" class="icon-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
+      <button id="finish-btn">Finish Review</button>
+    </div>
+  </header>
+  <main class="layout">
+    <section class="plan-wrap">
+      <div id="update-banner" class="update-banner" hidden>
+        <span class="dot"></span>
+        <span class="msg">Plan updated</span>
+        <button id="apply-update">Refresh</button>
+        <button id="dismiss-update" class="ghost">Dismiss</button>
+      </div>
+      <iframe id="blueprint-frame" title="Blueprint content" sandbox="allow-same-origin allow-scripts"></iframe>
+    </section>
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span id="comments-count" class="count"></span>
+        <button type="button" class="linkish" id="collapse-all">collapse all</button>
+        <span class="sep">·</span>
+        <button type="button" class="linkish" id="expand-all">expand all</button>
+      </div>
+      <div id="comments-list" class="comments">
+        <div class="comments-loading">
+          <div class="skeleton skeleton-group"></div>
+          <div class="skeleton skeleton-group"></div>
+          <div class="skeleton skeleton-group"></div>
+        </div>
+      </div>
+      <div id="drafts-bar" class="drafts-bar" hidden role="region" aria-label="Pending drafts">
+        <div class="drafts-bar-head">
+          <span id="drafts-count" class="drafts-count"></span>
+          <span class="drafts-bar-spacer"></span>
+          <button type="button" id="drafts-discard" class="ghost">Discard all</button>
+          <button type="button" id="drafts-submit">Submit all</button>
+        </div>
+        <div id="drafts-list" class="drafts-list"></div>
+      </div>
+      <div id="draft" class="draft" hidden>
+        <div class="quote" id="draft-quote"></div>
+        <textarea id="draft-body" placeholder="Comment on selection — ⌘+Enter to stage"></textarea>
+        <div class="draft-actions">
+          <button id="draft-submit">Add to batch</button>
+          <button id="draft-cancel" class="ghost">Cancel</button>
+        </div>
+      </div>
+      <div id="status-bar" class="status"></div>
+    </aside>
+  </main>
+
+  <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
+
+  <dialog id="shortcuts-dialog" class="shortcuts-dialog" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl>
+      <dt><kbd>⌘</kbd>+<kbd>Enter</kbd></dt><dd>Stage comment or reply (Submit all from the drafts bar)</dd>
+      <dt><kbd>Esc</kbd></dt><dd>Cancel draft / close this dialog</dd>
+      <dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Next / previous thread</dd>
+      <dt><kbd>r</kbd></dt><dd>Resolve focused thread</dd>
+      <dt><kbd>e</kbd> / <kbd>c</kbd></dt><dd>Expand all / collapse all</dd>
+      <dt><kbd>?</kbd></dt><dd>Show this help</dd>
+    </dl>
+    <div class="close-row">
+      <button type="button" id="shortcuts-close" autofocus>Close</button>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

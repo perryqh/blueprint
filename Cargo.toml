@@ -1,0 +1,37 @@
+[package]
+name = "blueprint"
+version = "0.1.0"
+edition = "2024"
+description = "Share interactive HTML blueprints with inline anchored comments"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+anyhow = "1"
+thiserror = "1"
+dirs = "5"
+mime_guess = "2"
+reqwest = { version = "0.12", features = ["json", "blocking", "cookies"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+oauth2 = "4"
+tower-sessions = "0.13"
+tower = "0.5"
+async-trait = "0.1"
+url = "2"
+nix = { version = "0.29", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+rusty-hook = "0.11"
+
+[profile.release]
+lto = "thin"
+strip = true

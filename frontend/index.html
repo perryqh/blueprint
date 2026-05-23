@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>blueprint</title>
+  <script>
+    try {
+      var t = localStorage.getItem('blueprint:theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="landing">
+  <main class="landing-main">
+    <h1>blueprint</h1>
+    <p class="landing-tag">Share interactive HTML blueprints with inline anchored comments.</p>
+    <p class="landing-help">Publish a blueprint from the CLI:</p>
+    <pre><code>blueprint publish path/to/blueprint.html</code></pre>
+    <h2>Active blueprints</h2>
+    <ul id="blueprint-list">
+      <li class="skeleton" style="height:48px"></li>
+      <li class="skeleton" style="height:48px"></li>
+      <li class="skeleton" style="height:48px"></li>
+    </ul>
+  </main>
+  <script>
+    fetch('/api/blueprints').then(r => r.json()).then(blueprints => {
+      const ul = document.getElementById('blueprint-list');
+      ul.innerHTML = '';
+      if (!blueprints.length) {
+        ul.innerHTML = '<li class="empty">No blueprints yet.</li>';
+        return;
+      }
+      for (const p of blueprints) {
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.href = '/b/' + p.slug;
+        a.textContent = p.slug;
+        li.appendChild(a);
+        const ts = document.createElement('span');
+        ts.className = 'ts';
+        ts.textContent = new Date(p.created_at).toLocaleString();
+        li.appendChild(ts);
+        ul.appendChild(li);
+      }
+    });
+  </script>
+</body>
+</html>
