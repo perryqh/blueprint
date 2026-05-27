@@ -1325,22 +1325,22 @@ dialog.shortcuts-dialog button {
   align-items: center;
   justify-content: center;
   margin: 0 auto var(--space-6);
-  padding: var(--space-6);
-  width: 384px;
+  padding: var(--space-4);
+  width: 200px;
   max-width: 100%;
   border-radius: var(--radius-lg);
   background-image:
     linear-gradient(var(--grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-  background-size: 24px 24px;
+  background-size: 16px 16px;
 }
 .hero-logo {
   display: block;
-  width: 320px;
+  width: 160px;
   height: auto;
   max-width: 100%;
   border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-md);
 }
 
 /* Topbar mark — sits to the left of the "blueprint" wordmark text. */
