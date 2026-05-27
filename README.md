@@ -8,25 +8,96 @@ Share interactive HTML blueprints with reviewers and let them leave inline ancho
 
 **Phase 0 — localhost MVP.** Single Rust binary, SQLite at `~/.blueprint/blueprints.db`, optional GitHub OAuth, vanilla-JS text-quote anchoring. Phase 1 (personal hosting) and Phase 2 (internal + Okta) are designed but not built.
 
-## Install
+## Run locally end-to-end
+
+Everything below assumes a fresh clone of this repo and `~/.cargo/bin` on your `$PATH`. The whole loop runs on `127.0.0.1` — nothing leaves your machine.
+
+### 1. Prereqs
+
+- Rust toolchain (1.74+). `rustup` is the easy path.
+- macOS or Linux. On Linux, install `libsqlite3-dev` and `pkg-config` if a build fails on rusqlite; macOS has them via the SDK.
+- Claude Code CLI installed and authenticated, if you want the `/blueprint` skill to drive the loop.
+
+### 2. Build and install the binary
 
 ```bash
 cargo install --path .
 ```
 
-Binary lands at `~/.cargo/bin/blueprint`.
+This drops the `blueprint` binary at `~/.cargo/bin/blueprint`. Sanity-check:
 
-## Use it
+```bash
+blueprint --version
+```
+
+### 3. (Optional) Configure GitHub OAuth
+
+Comments work anonymously out of the box — the daemon accepts `author` from the CLI / API. If you want commenters to sign in with GitHub (so author identity is verified in the browser), populate `~/.blueprint/env`:
+
+```ini
+# ~/.blueprint/env
+GITHUB_CLIENT_ID=Iv1.xxxxxxxxxxxxxxxx
+GITHUB_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SESSION_SECRET=any-long-random-string-used-as-a-marker
+```
+
+The registered OAuth app's callback URL is `http://127.0.0.1:7321/auth/github/callback`, so the daemon **must** bind port 7321 for the round-trip to work. That's the default; don't override unless you also re-register the OAuth app. Missing or partial env = OAuth disabled (and that's fine for local solo use).
+
+### 4. Smoke-test the daemon manually
+
+```bash
+echo '<h1>hello</h1><p>This is a smoke test.</p>' > /tmp/hello.html
+blueprint publish /tmp/hello.html              # spawns the daemon, opens the URL in your browser
+blueprint status                                # shows running daemon + blueprint list
+blueprint comment <slug> --quote "smoke test" 'looks good'
+blueprint fetch <slug>                          # writes ./.blueprint/<slug>/review.json
+blueprint unpublish <slug>                      # daemon auto-stops when no blueprints remain
+```
+
+If the publish step prints a `127.0.0.1:7321` URL and the page renders with a sidebar, you're wired up. If port 7321 is already in use, `lsof -i :7321` to find the squatter — or pass `--port` / set `BLUEPRINT_PORT` (OAuth login won't work on a different port).
+
+### 5. Install the Claude Code skill
+
+The skill lives in this repo at `integrations/claude-code/skills/blueprint/`. Symlink it into your Claude Code skill directory so the description triggers on plan-shaped asks:
+
+```bash
+ln -s "$PWD/integrations/claude-code/skills/blueprint" ~/.claude/skills/blueprint
+```
+
+Verify Claude Code sees it — start `claude` in any repo and run `/help`; you should see `blueprint` listed. The skill is intentionally broad: it auto-triggers on "plan", "design", "scope this out", "what's the implementation strategy for…", etc. — you rarely need to type `/blueprint` literally.
+
+### 6. Drive the loop with Claude
+
+Open a Claude Code session in the repo you're planning against and ask a plan-shaped question — e.g. `"plan how I'd add Slack notifications when a comment lands"`. The skill will:
+
+1. Write a self-contained HTML blueprint (executive summary, mockups, file-by-file plan, verification steps) to `~/.blueprint/drafts/<slug>.html`.
+2. Run `blueprint publish --no-open --json` and print the `127.0.0.1:7321/b/<slug>` URL back at you to open when you're ready.
+3. Start `blueprint watch <slug> --stream` in the background and use the `Monitor` tool to wake on each Submit-all batch.
+4. On each batch: edit the HTML in place, `blueprint publish --slug <slug> --update` (you'll see a "Blueprint updated" banner in the browser), and post threaded replies under each comment.
+
+Stage drafts in the sidebar and hit **Submit all** — that's one round trip, one wake-up. When you're done, click **Finish Review** in the browser or tell Claude in chat to wrap up; `blueprint watch` exits and the loop ends.
+
+### 7. Stop and clean up
+
+```bash
+blueprint status                  # check what's running
+blueprint unpublish <slug>        # remove one blueprint (daemon stops when empty)
+pkill -f 'blueprint serve'        # nuke the daemon
+rm -rf ~/.blueprint               # full reset — drops SQLite, drafts, env, lock file
+```
+
+## CLI reference
 
 ```bash
 blueprint publish path/to/blueprint.html        # auto-spawns daemon, opens in browser
+blueprint publish file.html --slug <slug> --update   # revise in place; reviewers see a refresh banner
+blueprint publish file.html --no-open --json    # script-friendly; prints {slug, url}
 blueprint status                                 # show running daemon + blueprints with comment counts
 blueprint comment <slug> --quote "..." 'comment body'
 blueprint comment <slug> --reply-to c_xxx 'reply body'
 blueprint watch <slug>                           # blocks until reviewer clicks Finish
 blueprint watch <slug> --stream                  # streams each new comment as JSON to stdout
 blueprint fetch <slug>                           # writes ./.blueprint/<slug>/review.json
-blueprint publish file.html --slug <slug> --update   # revise in place; reviewers see a refresh banner
 blueprint unpublish <slug>                       # daemon stops when no blueprints remain
 ```
 
@@ -69,25 +140,6 @@ The CLI is a thin wrapper over a REST API at `http://127.0.0.1:7321`:
 | `GET`    | `/api/blueprints/:slug/wait-comment?since=ts`       | Long-polls until a new comment arrives, ~30s timeout — used by `--stream`  |
 | `DELETE` | `/api/blueprints/:slug`                             | Unpublish                                                                  |
 | `POST`   | `/api/shutdown-if-empty`                            | Server-side count-and-stop; safe under concurrent publish                  |
-
-## Claude Code skill: `/blueprint`
-
-Ships at `integrations/claude-code/skills/blueprint/`. It's the default planning surface — its description is broad enough that Claude reaches for it whenever you'd otherwise get a plain Markdown plan, not just when you literally type `/blueprint`.
-
-What it does:
-
-1. Renders a **rich, self-contained HTML blueprint** — executive summary, context, code excerpts with file paths, mockups (HTML/CSS or inline SVG), verification steps. Includes the dark-mode-aware CSS variable starter so the blueprint adapts to the reviewer's theme.
-2. Publishes via `blueprint publish --no-open --json` — no browser auto-launch, just the URL printed back at you to open when you're ready.
-3. Starts `blueprint watch <slug> --stream` **in the background** and uses Claude Code's `Monitor` tool to react to each new Submit-all batch as it lands. You stage comments, hit submit; Claude wakes up, edits the HTML, re-publishes with `--update`, and posts threaded replies.
-4. Loop until you click **Finish Review** in the browser or tell Claude in chat to wrap up.
-
-Install (until a plugin marketplace is wired up):
-
-```bash
-ln -s "$PWD/integrations/claude-code/skills/blueprint" ~/.claude/skills/blueprint
-```
-
-The daemon binds port **7321** by default. That's the port hard-coded into the registered GitHub OAuth app's callback URL, so once you populate `~/.blueprint/env` with your credentials the redirect works end-to-end with no extra env exports. Override with `--port` on `blueprint serve` or `BLUEPRINT_PORT` if 7321 is already taken — but OAuth login won't work on any other port.
 
 ## Architecture
 
