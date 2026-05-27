@@ -27,6 +27,41 @@ pub struct BlueprintSummary {
     pub client_cwd: Option<String>,
 }
 
+/// Provenance tag attached to every comment. Determined server-side at write
+/// time from the request's `Identity`, then read by the agent + the frontend
+/// to decide rendering and whether a comment should trip a plan edit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorRole {
+    /// Logged-in session whose login matches `BLUEPRINT_OWNER_GITHUB_LOGIN`.
+    /// Only role that should trip an HTML edit in the skill.
+    Owner,
+    /// Logged-in session that isn't the owner. Includes the CLI bearer path
+    /// (agent traffic) — Claude posts as `user` and the orthogonal `is_agent`
+    /// flag distinguishes its replies in the UI.
+    User,
+    /// No session, no bearer. Anonymous browser commenter.
+    Guest,
+}
+
+impl AuthorRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthorRole::Owner => "owner",
+            AuthorRole::User => "user",
+            AuthorRole::Guest => "guest",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "owner" => AuthorRole::Owner,
+            "user" => AuthorRole::User,
+            _ => AuthorRole::Guest,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub id: String,
@@ -45,6 +80,8 @@ pub struct Comment {
     pub author_user_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_avatar_url: Option<String>,
+    pub role: AuthorRole,
+    pub is_agent: bool,
 }
 
 /// Input shape for `Store::add_comments_batch`. Mirrors `add_comment`'s
@@ -59,6 +96,8 @@ pub struct CommentDraft {
     pub parent_id: Option<String>,
     pub author_user_id: Option<i64>,
     pub author_avatar_url: Option<String>,
+    pub role: AuthorRole,
+    pub is_agent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +183,11 @@ impl Store {
                 "client_cwd",
                 "ALTER TABLE blueprints ADD COLUMN client_cwd TEXT",
             ),
+            (
+                "comments",
+                "is_agent",
+                "ALTER TABLE comments ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0",
+            ),
         ] {
             let exists: bool = conn
                 .query_row(
@@ -156,6 +200,32 @@ impl Store {
             if !exists {
                 conn.execute(ddl, [])?;
             }
+        }
+
+        // D4: atomic ALTER + backfill for the `role` column. If we crashed
+        // between the ALTER and the UPDATE on a non-transactional migration,
+        // the next startup would see the column present and skip the backfill
+        // entirely, stranding every pre-existing logged-in comment as `guest`.
+        // Wrap both in a single transaction so it's all-or-nothing.
+        let role_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('comments') WHERE name = 'role'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !role_exists {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "ALTER TABLE comments ADD COLUMN role TEXT NOT NULL DEFAULT 'guest'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE comments SET role = 'user' WHERE author_user_id IS NOT NULL",
+                [],
+            )?;
+            tx.commit()?;
         }
 
         Ok(Store {
@@ -356,14 +426,16 @@ impl Store {
         parent_id: Option<&str>,
         author_user_id: Option<i64>,
         author_avatar_url: Option<String>,
+        role: AuthorRole,
+        is_agent: bool,
     ) -> Result<Comment, AppError> {
         let now = now_ms();
         let sel_json = serde_json::to_string(selector)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
-            params![id, slug, author, body, sel_json, parent_id, now, author_user_id],
+            "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
+            params![id, slug, author, body, sel_json, parent_id, now, author_user_id, role.as_str(), is_agent as i64],
         )?;
         // If this comment is a reply, clear processing state on its parent — the agent
         // that was working on it has now produced its response.
@@ -387,6 +459,8 @@ impl Store {
             processing_started_at: None,
             author_user_id,
             author_avatar_url,
+            role,
+            is_agent,
         })
     }
 
@@ -442,8 +516,8 @@ impl Store {
         for d in drafts {
             let sel_json = serde_json::to_string(&d.selector)?;
             tx.execute(
-                "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+                "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
                 params![
                     d.id,
                     slug,
@@ -452,7 +526,9 @@ impl Store {
                     sel_json,
                     d.parent_id,
                     now,
-                    d.author_user_id
+                    d.author_user_id,
+                    d.role.as_str(),
+                    d.is_agent as i64,
                 ],
             )?;
             if let Some(pid) = &d.parent_id {
@@ -471,6 +547,8 @@ impl Store {
                 processing_started_at: None,
                 author_user_id: d.author_user_id,
                 author_avatar_url: d.author_avatar_url.clone(),
+                role: d.role,
+                is_agent: d.is_agent,
             });
         }
         // Mirror add_comment's behavior: any parent that just got a reply
@@ -491,7 +569,7 @@ impl Store {
         let row = conn
             .query_row(
                 "SELECT c.id, c.slug, c.author, c.body, c.selector, c.parent_id, c.resolved, c.created_at,
-                        c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url
+                        c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url, c.role, c.is_agent
                  FROM comments c LEFT JOIN users u ON c.author_user_id = u.id
                  WHERE c.slug = ?1 AND c.id = ?2",
                 params![slug, id],
@@ -505,7 +583,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.slug, c.author, c.body, c.selector, c.parent_id, c.resolved, c.created_at,
-                    c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url
+                    c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url, c.role, c.is_agent
              FROM comments c LEFT JOIN users u ON c.author_user_id = u.id
              WHERE c.slug = ?1 AND c.created_at > ?2 ORDER BY c.created_at ASC",
         )?;
@@ -558,6 +636,8 @@ fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
         rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let resolved: i64 = r.get(6)?;
+    let role_str: String = r.get(12)?;
+    let is_agent_int: i64 = r.get(13)?;
     Ok(Comment {
         id: r.get(0)?,
         slug: r.get(1)?,
@@ -571,6 +651,8 @@ fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
         processing_started_at: r.get(9)?,
         author_user_id: r.get(10)?,
         author_avatar_url: r.get(11)?,
+        role: AuthorRole::from_str(&role_str),
+        is_agent: is_agent_int != 0,
     })
 }
 

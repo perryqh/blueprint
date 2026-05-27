@@ -38,6 +38,12 @@ pub struct AuthConfig {
     /// `Authorization: Bearer ...` on write requests. Auto-generated on daemon
     /// startup if the file is missing.
     pub cli_token: String,
+    /// GitHub login (case-insensitive) of the blueprint owner — the one user
+    /// whose comments should trip a plan edit. Read from
+    /// `BLUEPRINT_OWNER_GITHUB_LOGIN`. `None` = no owner; every comment is
+    /// `guest` or `user` and (per the skill) every comment trips an edit, so
+    /// the daemon logs a startup WARN to make that obvious.
+    pub owner_login: Option<String>,
 }
 
 impl AuthConfig {
@@ -56,6 +62,10 @@ impl AuthConfig {
         let profile_url = std::env::var("OAUTH_PROFILE_URL")
             .unwrap_or_else(|_| "https://api.github.com/user".into());
         let cli_token = ensure_cli_token();
+        let owner_login = std::env::var("BLUEPRINT_OWNER_GITHUB_LOGIN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         AuthConfig {
             client_id,
             client_secret,
@@ -65,6 +75,7 @@ impl AuthConfig {
             token_url,
             profile_url,
             cli_token,
+            owner_login,
         }
     }
 
@@ -198,17 +209,63 @@ pub async fn identity_from_request(
     Ok(Identity::None)
 }
 
-/// Returns `Unauthorized` if auth is enabled and no identity is present.
-/// In legacy mode (auth not configured), all writes are allowed.
-pub fn require_identity_for_writes(identity: &Identity, state: &AppState) -> Result<(), AppError> {
-    let auth_enabled = state.auth.as_ref().is_some_and(|a| a.enabled);
-    if !auth_enabled {
-        return Ok(());
-    }
+/// Phase 0: localhost-only daemon, no impersonation defense needed beyond the
+/// per-comment role tag. Anonymous browser writes are accepted; the frontend
+/// renders them as `guest` and the agent decides whether to act based on
+/// `role`. The function is kept so the call-sites stay symmetric and so a
+/// future phase can re-gate without re-threading the extractor.
+pub fn require_identity_for_writes(
+    _identity: &Identity,
+    _state: &AppState,
+) -> Result<(), AppError> {
+    Ok(())
+}
+
+/// Map an `Identity` to the role we stamp on writes.
+///
+/// - `SessionUser` whose login matches `owner_login` (case-insensitive) → `Owner`.
+/// - Any other `SessionUser` → `User`.
+/// - `CliBearer` → `User`. The agent posts as a "user" role; its
+///   distinguishing flag is the orthogonal `is_agent` boolean.
+/// - `None` → `Guest`.
+pub fn role_for(identity: &Identity, state: &AppState) -> crate::store::AuthorRole {
+    use crate::store::AuthorRole;
     match identity {
-        Identity::SessionUser(_) | Identity::CliBearer => Ok(()),
-        Identity::None => Err(AppError::Unauthorized),
+        Identity::SessionUser(u) => {
+            let owner = state
+                .auth
+                .as_ref()
+                .and_then(|a| a.owner_login.as_deref())
+                .unwrap_or("");
+            if !owner.is_empty() && owner.eq_ignore_ascii_case(&u.login) {
+                AuthorRole::Owner
+            } else {
+                AuthorRole::User
+            }
+        }
+        Identity::CliBearer => AuthorRole::User,
+        Identity::None => AuthorRole::Guest,
     }
+}
+
+/// Is the calling identity the agent (CLI bearer)? Used to render Claude's
+/// replies distinctly in the frontend. Replaces the brittle
+/// `author.toLowerCase() === 'claude'` heuristic — the CLI posts as
+/// `'Claude Code'` so the string check never fired.
+pub fn is_agent(identity: &Identity) -> bool {
+    matches!(identity, Identity::CliBearer)
+}
+
+/// Is `login` the configured blueprint owner? Used to render the "owner" pill
+/// on `/api/me` so the frontend can distinguish the driving user without
+/// re-deriving it from the role on every comment.
+pub fn is_owner_login(state: &AppState, login: &str) -> bool {
+    let owner = state
+        .auth
+        .as_ref()
+        .and_then(|a| a.owner_login.as_deref())
+        .unwrap_or("");
+    !owner.is_empty() && owner.eq_ignore_ascii_case(login)
 }
 
 /// Axum extractor that resolves the request's identity AND enforces the
@@ -365,6 +422,7 @@ pub struct MeResponse {
     pub login: String,
     pub name: Option<String>,
     pub avatar_url: Option<String>,
+    pub is_owner: bool,
 }
 
 /// GET /api/me — returns the current user, or 401.
@@ -375,10 +433,12 @@ pub async fn me(
     let user = current_user(&session, &state)
         .await?
         .ok_or(AppError::Unauthorized)?;
+    let is_owner = is_owner_login(&state, &user.login);
     Ok(Json(MeResponse {
         id: user.id,
         login: user.login,
         name: user.name,
         avatar_url: user.avatar_url,
+        is_owner,
     }))
 }

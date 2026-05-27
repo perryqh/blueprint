@@ -245,6 +245,23 @@ async fn wait_for_daemon(timeout: Duration) -> Result<LockInfo> {
 pub async fn run_foreground(preferred_port: Option<u16>) -> Result<()> {
     let store = Arc::new(Store::open(&db_path()).context("opening sqlite store")?);
     let auth_cfg = crate::auth::AuthConfig::from_env();
+
+    // D3: surface the two role-config misconfigurations loudly. Either branch
+    // means owner-role assignment is silently broken; an early stderr line
+    // saves a confused debug session when comments never trip a plan edit.
+    if auth_cfg.enabled && auth_cfg.owner_login.is_none() {
+        eprintln!(
+            "warn: GitHub OAuth is enabled but BLUEPRINT_OWNER_GITHUB_LOGIN is unset — \
+             no comment will trigger a plan edit. Set it in ~/.blueprint/env to identify yourself."
+        );
+    }
+    if !auth_cfg.enabled && auth_cfg.owner_login.is_some() {
+        eprintln!(
+            "warn: BLUEPRINT_OWNER_GITHUB_LOGIN is set but GitHub OAuth credentials are missing — \
+             owner role will never be assigned. Add GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET to ~/.blueprint/env."
+        );
+    }
+
     let auth = if auth_cfg.enabled {
         Some(Arc::new(auth_cfg))
     } else {

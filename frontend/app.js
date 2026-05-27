@@ -27,7 +27,7 @@ function renderAuthChip(user) {
   chip.hidden = false;
   if (user) {
     if (legacyAuthorInput) legacyAuthorInput.style.display = 'none';
-    const av = makeAvatar(document, user.login, user.avatar_url);
+    const av = makeAvatar(document, user.login, user.avatar_url, false);
     av.style.width = '22px';
     av.style.height = '22px';
     chip.appendChild(av);
@@ -35,6 +35,12 @@ function renderAuthChip(user) {
     name.className = 'auth-chip-name';
     name.textContent = user.login;
     chip.appendChild(name);
+    if (user.is_owner) {
+      const pill = document.createElement('span');
+      pill.className = 'role-pill role-owner';
+      pill.textContent = 'owner';
+      chip.appendChild(pill);
+    }
     const out = document.createElement('a');
     out.href = '#';
     out.className = 'auth-chip-out';
@@ -119,7 +125,7 @@ function authorInitials(name) {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
-function makeAvatar(doc, name, avatarUrl) {
+function makeAvatar(doc, name, avatarUrl, isAgent) {
   if (avatarUrl) {
     const img = doc.createElement('img');
     img.className = 'avatar avatar-img';
@@ -131,7 +137,10 @@ function makeAvatar(doc, name, avatarUrl) {
   const el = doc.createElement('span');
   el.className = 'avatar';
   el.textContent = authorInitials(name);
-  if (name && name.toLowerCase() === 'claude') {
+  // Agent flag is server-stamped via Identity::CliBearer — see src/auth.rs::is_agent.
+  // Replaces the old `name.toLowerCase() === 'claude'` heuristic, which never
+  // matched because the CLI posts as `--author 'Claude Code'`.
+  if (isAgent) {
     el.style.background = 'var(--avatar-claude)';
   } else {
     el.style.background = authorGradient(name || 'anonymous');
@@ -539,10 +548,10 @@ document.getElementById('finish-btn').addEventListener('click', async (e) => {
 async function refreshComments() {
   const r = await fetch(`/api/blueprints/${slug}/comments`);
   if (!r.ok) return;
-  const { comments, server_ts, plan_version } = await r.json();
+  const { comments, server_ts, blueprint_version } = await r.json();
   lastTs = server_ts;
   allComments = comments;
-  if (lastBlueprintVersion === null) lastBlueprintVersion = plan_version;
+  if (lastBlueprintVersion === null) lastBlueprintVersion = blueprint_version;
   // Seed auto-scroll bookkeeping so the first poll doesn't mistake existing
   // comments for new arrivals.
   prevTopIds = comments.filter(c => !c.parent_id).map(c => c.id);
@@ -558,7 +567,7 @@ async function pollOnce() {
     // comments — processing flags going on/off, resolve toggles — actually propagate.
     const r = await fetch(`/api/blueprints/${slug}/comments`);
     if (!r.ok) return;
-    const { comments, server_ts, plan_version } = await r.json();
+    const { comments, server_ts, blueprint_version } = await r.json();
     lastTs = server_ts;
 
     // If the server has a newer plan version than what we've loaded, show a banner
@@ -567,9 +576,9 @@ async function pollOnce() {
     // null, treat this poll as the baseline-setter rather than a "newer version" trigger.
     const effectiveLoaded = pendingBlueprintVersion ?? lastBlueprintVersion;
     if (effectiveLoaded === null) {
-      lastBlueprintVersion = plan_version;
-    } else if (plan_version !== effectiveLoaded) {
-      pendingBlueprintVersion = plan_version;
+      lastBlueprintVersion = blueprint_version;
+    } else if (blueprint_version !== effectiveLoaded) {
+      pendingBlueprintVersion = blueprint_version;
       pendingUpdateCount += 1;
       showUpdateBanner();
     }
@@ -994,14 +1003,32 @@ function scrollFrameToQuote(quote) {
 
 function renderComment(c, replies, byParent) {
   const wrap = document.createElement('div');
-  wrap.className = 'comment';
+  // Role-based outline: owner gets a solid accent border, guest a dashed muted
+  // border. Both live in styles.css. Plain `user` (incl. logged-in non-owner)
+  // renders without an extra class.
+  wrap.className = 'comment'
+    + (c.role === 'owner' ? ' is-owner' : '')
+    + (c.role === 'guest' ? ' is-guest' : '');
   const author = document.createElement('div');
-  author.className = 'author' + (c.author.toLowerCase() === 'claude' ? ' claude' : '');
-  author.appendChild(makeAvatar(document, c.author, c.author_avatar_url));
+  author.className = 'author' + (c.is_agent ? ' claude' : '');
+  author.appendChild(makeAvatar(document, c.author, c.author_avatar_url, c.is_agent));
   const nameSpan = document.createElement('span');
   nameSpan.className = 'a-name';
   nameSpan.textContent = c.author;
   author.appendChild(nameSpan);
+  // Owner / guest pills next to the author name. `user` (no pill) keeps the
+  // sidebar quiet for the common case.
+  if (c.role === 'owner') {
+    const pill = document.createElement('span');
+    pill.className = 'role-pill role-owner';
+    pill.textContent = 'owner';
+    author.appendChild(pill);
+  } else if (c.role === 'guest') {
+    const pill = document.createElement('span');
+    pill.className = 'role-pill role-guest';
+    pill.textContent = 'guest';
+    author.appendChild(pill);
+  }
   const ts = document.createElement('span');
   ts.className = 'ts';
   ts.dataset.ts = String(c.created_at);
@@ -1021,7 +1048,7 @@ function renderComment(c, replies, byParent) {
     if (age >= 0 && age < PROCESSING_TTL_MS) {
       const working = document.createElement('div');
       working.className = 'working-indicator';
-      const av = makeAvatar(document, c.processing_by);
+      const av = makeAvatar(document, c.processing_by, null, false);
       av.style.width = '16px';
       av.style.height = '16px';
       av.style.fontSize = '8px';

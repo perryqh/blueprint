@@ -368,8 +368,10 @@ async fn create_comment(
         crate::auth::Identity::SessionUser(u) => {
             (u.login.clone(), Some(u.id), u.avatar_url.clone())
         }
-        _ => (input.author.clone(), None, None),
+        _ => (sanitize_author(&input.author), None, None),
     };
+    let role = crate::auth::role_for(&identity, &state);
+    let is_agent = crate::auth::is_agent(&identity);
     let id = slug::comment_id();
     let comment = state.store.add_comment(
         &slug,
@@ -380,12 +382,27 @@ async fn create_comment(
         input.parent_id.as_deref(),
         author_user_id,
         author_avatar_url,
+        role,
+        is_agent,
     )?;
     let _ = state.events.send(Event {
         slug: slug.clone(),
         kind: EventKind::CommentAdded(id),
     });
     Ok(Json(comment))
+}
+
+/// Normalize an unauthenticated author string. Empty / whitespace → `"anonymous"`
+/// so the wire shape is never blank. Server-side mirror of the frontend default
+/// at `frontend/app.js` — defense in depth for guests submitting without filling
+/// the legacy author input.
+fn sanitize_author(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "anonymous".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[derive(Deserialize)]
@@ -438,13 +455,15 @@ async fn create_comments_batch(
         }
         _ => (None, None, None),
     };
+    let role = crate::auth::role_for(&identity, &state);
+    let is_agent = crate::auth::is_agent(&identity);
 
     let drafts: Vec<CommentDraft> = inputs
         .into_iter()
         .map(|input| {
             let author = session_author
                 .clone()
-                .unwrap_or_else(|| input.author.clone());
+                .unwrap_or_else(|| sanitize_author(&input.author));
             CommentDraft {
                 id: slug::comment_id(),
                 author,
@@ -453,6 +472,8 @@ async fn create_comments_batch(
                 parent_id: input.parent_id,
                 author_user_id: session_user_id,
                 author_avatar_url: session_avatar.clone(),
+                role,
+                is_agent,
             }
         })
         .collect();
@@ -486,8 +507,10 @@ async fn create_reply(
         crate::auth::Identity::SessionUser(u) => {
             (u.login.clone(), Some(u.id), u.avatar_url.clone())
         }
-        _ => (input.author.clone(), None, None),
+        _ => (sanitize_author(&input.author), None, None),
     };
+    let role = crate::auth::role_for(&identity, &state);
+    let is_agent = crate::auth::is_agent(&identity);
     let id = slug::comment_id();
     let comment = state.store.add_comment(
         &slug,
@@ -498,6 +521,8 @@ async fn create_reply(
         Some(&parent_id),
         author_user_id,
         author_avatar_url,
+        role,
+        is_agent,
     )?;
     let _ = state.events.send(Event {
         slug: slug.clone(),

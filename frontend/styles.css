@@ -765,6 +765,47 @@ iframe#blueprint-frame {
   gap: var(--space-2);
 }
 .comments .author.claude .a-name { color: var(--color-accent); }
+
+/* Role pills + role-bordered comments. Driven by server-stamped `c.role`
+   and `c.is_agent`; see src/store.rs::AuthorRole and src/auth.rs::role_for. */
+.comments .role-pill {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  padding: 1px 6px;
+  border-radius: 10px;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+}
+.comments .role-pill.role-owner {
+  background: var(--color-accent-bg);
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent-border);
+}
+.comments .role-pill.role-guest {
+  background: transparent;
+  color: var(--color-fg-faint);
+  border: 1px dashed var(--color-border-strong);
+}
+.comments .comment.is-owner {
+  border-left: 3px solid var(--color-accent);
+  padding-left: var(--space-2);
+}
+.comments .comment.is-guest {
+  border-left: 3px dashed var(--color-border-strong);
+  padding-left: var(--space-2);
+  opacity: 0.96;
+}
+.auth-chip .role-pill {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+.auth-chip .role-pill.role-owner {
+  background: var(--color-accent-bg);
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent-border);
+}
 .comments .avatar {
   width: 20px;
   height: 20px;

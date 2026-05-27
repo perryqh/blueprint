@@ -30,18 +30,31 @@ This drops the `blueprint` binary at `~/.cargo/bin/blueprint`. Sanity-check:
 blueprint --version
 ```
 
-### 3. (Optional) Configure GitHub OAuth
+### 3. (Optional) Configure GitHub OAuth + the owner login
 
-Comments work anonymously out of the box — the daemon accepts `author` from the CLI / API. If you want commenters to sign in with GitHub (so author identity is verified in the browser), populate `~/.blueprint/env`:
+Anonymous browser commenters always work — they always have. What OAuth adds is **provenance**: each comment is tagged with a server-stamped `role`, and only one specific role triggers a plan edit from Claude. There are three roles:
+
+| Role    | Identified by                                                              | Triggers a plan edit? |
+| ------- | -------------------------------------------------------------------------- | --------------------- |
+| `owner` | logged-in GitHub session whose login matches `BLUEPRINT_OWNER_GITHUB_LOGIN` | **Yes**               |
+| `user`  | any other logged-in session (or the CLI/agent bearer)                       | No — reply only       |
+| `guest` | anonymous browser commenter (no session)                                    | No — reply only       |
+
+In legacy mode (no OAuth env), everything lands as `guest` and there is no owner; Claude treats every comment as a potential plan edit, same as before this change.
+
+To enable OAuth and the owner role, populate `~/.blueprint/env`:
 
 ```ini
 # ~/.blueprint/env
 GITHUB_CLIENT_ID=Iv1.xxxxxxxxxxxxxxxx
 GITHUB_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-SESSION_SECRET=any-long-random-string-used-as-a-marker
+SESSION_SECRET=any-long-random-string
+BLUEPRINT_OWNER_GITHUB_LOGIN=your-github-login   # case-insensitive
 ```
 
-The registered OAuth app's callback URL is `http://127.0.0.1:7321/auth/github/callback`, so the daemon **must** bind port 7321 for the round-trip to work. That's the default; don't override unless you also re-register the OAuth app. Missing or partial env = OAuth disabled (and that's fine for local solo use).
+`BLUEPRINT_OWNER_GITHUB_LOGIN` is **optional**. If you set it without the two `GITHUB_*` vars, the daemon prints a startup WARN — owner-role assignment depends on the OAuth session, so the env var is dead config without it. Same the other way: enable OAuth without setting the owner, and you'll get a different WARN noting that no comment will trip a plan edit.
+
+The registered OAuth app's callback URL is `http://127.0.0.1:7321/auth/github/callback`, so the daemon **must** bind port 7321 for the round-trip to work. That's the default; don't override unless you also re-register the OAuth app. To drop back to anonymous mode, delete `~/.blueprint/env` (or unset the two `GITHUB_*` vars) and restart the daemon.
 
 ### 4. Smoke-test the daemon manually
 
@@ -58,22 +71,36 @@ If the publish step prints a `127.0.0.1:7321` URL and the page renders with a si
 
 ### 5. Install the Claude Code skill
 
-The skill lives in this repo at `integrations/claude-code/skills/blueprint/`. Symlink it into your Claude Code skill directory so the description triggers on plan-shaped asks:
+The skill lives in this repo at `integrations/claude-code/skills/blueprint/`. Symlink it into your Claude Code skill directory:
 
 ```bash
 ln -s "$PWD/integrations/claude-code/skills/blueprint" ~/.claude/skills/blueprint
 ```
 
-Verify Claude Code sees it — start `claude` in any repo and run `/help`; you should see `blueprint` listed. The skill is intentionally broad: it auto-triggers on "plan", "design", "scope this out", "what's the implementation strategy for…", etc. — you rarely need to type `/blueprint` literally.
+Verify Claude Code sees it — start `claude` in any repo and run `/help`; `/blueprint` should be listed under user-invocable skills.
 
 ### 6. Drive the loop with Claude
 
-Open a Claude Code session in the repo you're planning against and ask a plan-shaped question — e.g. `"plan how I'd add Slack notifications when a comment lands"`. The skill will:
+Inside a Claude Code session in the repo you're planning against:
+
+```
+/blueprint <one-line topic>
+```
+
+That's the whole interface. Examples:
+
+```
+/blueprint add slack notifications when a comment lands
+/blueprint scope out multi-tenant support
+/blueprint refactor the comment-batching path
+```
+
+The skill will:
 
 1. Write a self-contained HTML blueprint (executive summary, mockups, file-by-file plan, verification steps) to `~/.blueprint/drafts/<slug>.html`.
 2. Run `blueprint publish --no-open --json` and print the `127.0.0.1:7321/b/<slug>` URL back at you to open when you're ready.
 3. Start `blueprint watch <slug> --stream` in the background and use the `Monitor` tool to wake on each Submit-all batch.
-4. On each batch: edit the HTML in place, `blueprint publish --slug <slug> --update` (you'll see a "Blueprint updated" banner in the browser), and post threaded replies under each comment.
+4. On each batch: triage by role (owner edits → HTML edit + reply; user / guest comments → reply only — see Step 3's role table), then `blueprint publish --slug <slug> --update` once per batch and post threaded replies. The browser shows a "Plan updated" banner; click Refresh to reload the iframe in place.
 
 Stage drafts in the sidebar and hit **Submit all** — that's one round trip, one wake-up. When you're done, click **Finish Review** in the browser or tell Claude in chat to wrap up; `blueprint watch` exits and the loop ends.
 
@@ -121,6 +148,8 @@ blueprint unpublish <slug>                       # daemon stops when no blueprin
 
 **Cache hygiene.** `/static/*` and `/api/blueprints/:slug/raw` set `Cache-Control: no-store` so a browser never serves stale frontend assets or stale blueprint HTML.
 
+**Roles and the write gate.** Every comment is server-stamped with a `role` (`owner` / `user` / `guest`) and an `is_agent` boolean derived from the request's identity at write time (see `src/auth.rs::role_for` and `::is_agent`). The Claude skill keys its triage off `c.role` — only `owner` comments trigger plan edits; everyone else gets a reply only. There is no 401 gate on anonymous writes: the daemon is localhost-only and provenance via the `role` tag is the defense. See Step 3 above for the env-var configuration.
+
 ## HTTP API
 
 The CLI is a thin wrapper over a REST API at `http://127.0.0.1:7321`:
@@ -140,6 +169,9 @@ The CLI is a thin wrapper over a REST API at `http://127.0.0.1:7321`:
 | `GET`    | `/api/blueprints/:slug/wait-comment?since=ts`       | Long-polls until a new comment arrives, ~30s timeout — used by `--stream`  |
 | `DELETE` | `/api/blueprints/:slug`                             | Unpublish                                                                  |
 | `POST`   | `/api/shutdown-if-empty`                            | Server-side count-and-stop; safe under concurrent publish                  |
+| `GET`    | `/api/me`                                           | `{ id, login, name, avatar_url, is_owner }` or 401 — used by the chrome    |
+
+Every `Comment` returned by the API includes `role` (`"owner" | "user" | "guest"`) and `is_agent` (boolean) alongside `author`, `body`, `selector`, etc. — both fields are server-stamped from the request's identity, not from anything the client sends.
 
 ## Architecture
 

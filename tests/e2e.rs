@@ -777,6 +777,8 @@ fn test_comment(
         processing_started_at: None,
         author_user_id: None,
         author_avatar_url: None,
+        role: blueprint::store::AuthorRole::Guest,
+        is_agent: false,
     }
 }
 
@@ -859,6 +861,7 @@ async fn spawn_with_auth() -> AuthedTest {
         token_url: format!("{}/login/oauth/access_token", mock_base),
         profile_url: format!("{}/user", mock_base),
         cli_token: cli_token.clone(),
+        owner_login: None,
     };
     let tmp = spawn_daemon_on(listener, Some(Arc::new(auth))).await;
 
@@ -1009,17 +1012,351 @@ async fn callback_with_bad_state_returns_400() {
 }
 
 #[tokio::test]
-async fn write_without_auth_returns_401_when_auth_enabled() {
+async fn write_without_auth_succeeds_and_tags_comment_as_guest() {
+    // Phase 0: localhost-only, no impersonation defense. Anonymous browser
+    // writes go through; the per-comment `role` tag makes provenance visible.
     let s = spawn_with_auth().await;
     let http = client();
-    // Publish requires auth now.
+
+    // Publish works without auth.
     let r = http
         .post(format!("{}/api/blueprints", s.daemon_base))
-        .json(&json!({ "html": "<p>x</p>", "slug": "p" }))
+        .json(&json!({ "html": "<p>x</p>", "slug": "anon-pub" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 401);
+    assert_eq!(r.status(), 200);
+
+    // Anonymous comment lands with role: "guest", is_agent: false.
+    let c: Value = http
+        .post(format!(
+            "{}/api/blueprints/anon-pub/comments",
+            s.daemon_base
+        ))
+        .json(&json!({
+            "author": "drive-by",
+            "body": "hi",
+            "selector": { "type": "TextQuoteSelector", "exact": "x" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(c["role"], "guest");
+    assert_eq!(c["is_agent"], false);
+    assert_eq!(c["author"], "drive-by");
+}
+
+#[tokio::test]
+async fn anonymous_empty_author_defaults_to_anonymous_server_side() {
+    let s = spawn_with_auth().await;
+    let http = client();
+    http.post(format!("{}/api/blueprints", s.daemon_base))
+        .json(&json!({ "html": "<p>x</p>", "slug": "empty-author" }))
+        .send()
+        .await
+        .unwrap();
+    let c: Value = http
+        .post(format!(
+            "{}/api/blueprints/empty-author/comments",
+            s.daemon_base
+        ))
+        .json(&json!({
+            "author": "   ",
+            "body": "hi",
+            "selector": { "type": "TextQuoteSelector", "exact": "x" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(c["author"], "anonymous");
+}
+
+#[tokio::test]
+async fn cli_bearer_comment_lands_with_role_user_and_is_agent_true() {
+    // D5: the path Claude itself uses for replies. role = user (orthogonal to
+    // owner-edit decisions), is_agent = true so the frontend renders it as
+    // an agent reply without depending on the brittle author-string heuristic.
+    let s = spawn_with_auth().await;
+    let http = client();
+    http.post(format!("{}/api/blueprints", s.daemon_base))
+        .bearer_auth(&s.cli_token)
+        .json(&json!({ "html": "<p>x</p>", "slug": "bearer-test" }))
+        .send()
+        .await
+        .unwrap();
+    let c: Value = http
+        .post(format!(
+            "{}/api/blueprints/bearer-test/comments",
+            s.daemon_base
+        ))
+        .bearer_auth(&s.cli_token)
+        .json(&json!({
+            "author": "Claude Code",
+            "body": "agent reply",
+            "selector": { "type": "TextQuoteSelector", "exact": "x" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(c["role"], "user");
+    assert_eq!(c["is_agent"], true);
+    assert_eq!(c["author"], "Claude Code");
+}
+
+/// Session-authenticated comment from a user who is NOT the configured owner
+/// → role: "user", is_agent: false, is_owner on /api/me is false.
+#[tokio::test]
+async fn session_non_owner_lands_as_user_role() {
+    let s = spawn_with_auth().await;
+    let http = browser_client();
+    oauth_round_trip(&http, &s.daemon_base).await;
+
+    let me: Value = http
+        .get(format!("{}/api/me", s.daemon_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["login"], "mockuser");
+    assert_eq!(me["is_owner"], false);
+
+    http.post(format!("{}/api/blueprints", s.daemon_base))
+        .json(&json!({ "html": "<p>x</p>", "slug": "non-owner" }))
+        .send()
+        .await
+        .unwrap();
+    let c: Value = http
+        .post(format!(
+            "{}/api/blueprints/non-owner/comments",
+            s.daemon_base
+        ))
+        .json(&json!({
+            "author": "ignored",
+            "body": "hi",
+            "selector": { "type": "TextQuoteSelector", "exact": "x" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(c["author"], "mockuser");
+    assert_eq!(c["role"], "user");
+    assert_eq!(c["is_agent"], false);
+}
+
+/// Session-authenticated comment from the configured owner login →
+/// role: "owner", is_owner: true on /api/me.
+#[tokio::test]
+async fn session_owner_lands_as_owner_role() {
+    let s = spawn_with_auth_owner("mockuser").await;
+    let http = browser_client();
+    oauth_round_trip(&http, &s.daemon_base).await;
+
+    let me: Value = http
+        .get(format!("{}/api/me", s.daemon_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["is_owner"], true);
+
+    http.post(format!("{}/api/blueprints", s.daemon_base))
+        .json(&json!({ "html": "<p>x</p>", "slug": "owner-test" }))
+        .send()
+        .await
+        .unwrap();
+    let c: Value = http
+        .post(format!(
+            "{}/api/blueprints/owner-test/comments",
+            s.daemon_base
+        ))
+        .json(&json!({
+            "author": "ignored",
+            "body": "drive the plan",
+            "selector": { "type": "TextQuoteSelector", "exact": "x" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(c["role"], "owner");
+    assert_eq!(c["is_agent"], false);
+}
+
+/// Owner-matching is case-insensitive — GitHub login comparison shouldn't
+/// care whether the env var was written with the same casing as the GH login.
+#[tokio::test]
+async fn owner_login_match_is_case_insensitive() {
+    let s = spawn_with_auth_owner("MockUser").await;
+    let http = browser_client();
+    oauth_round_trip(&http, &s.daemon_base).await;
+
+    let me: Value = http
+        .get(format!("{}/api/me", s.daemon_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["is_owner"], true);
+}
+
+/// D4 migration: an existing comments DB written by the pre-role code path
+/// should backfill `role = 'user'` for every row with `author_user_id`
+/// set, leaving everything else as `'guest'`. The ALTER + UPDATE run in
+/// a single transaction so a crash between them can't strand old rows.
+#[tokio::test]
+async fn migration_backfills_role_for_existing_logged_in_comments() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("blueprints.db");
+
+    // Hand-write a DB that looks like the pre-role schema.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE blueprints (
+          slug TEXT PRIMARY KEY,
+          html BLOB NOT NULL,
+          created_at INTEGER NOT NULL,
+          delete_token TEXT NOT NULL
+        );
+        CREATE TABLE comments (
+          id TEXT PRIMARY KEY,
+          slug TEXT NOT NULL,
+          author TEXT NOT NULL,
+          body TEXT NOT NULL,
+          selector TEXT NOT NULL,
+          parent_id TEXT,
+          resolved INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          processing_by TEXT,
+          processing_started_at INTEGER,
+          author_user_id INTEGER
+        );
+        INSERT INTO blueprints (slug, html, created_at, delete_token) VALUES ('legacy', x'7878', 0, 'tok');
+        INSERT INTO comments (id, slug, author, body, selector, created_at, author_user_id)
+            VALUES ('c_old_logged_in', 'legacy', 'mockuser',
+                    'old reply', '{"type":"TextQuoteSelector","exact":"x"}', 0, 42);
+        INSERT INTO comments (id, slug, author, body, selector, created_at, author_user_id)
+            VALUES ('c_old_anon', 'legacy', 'drive-by',
+                    'old anon', '{"type":"TextQuoteSelector","exact":"x"}', 0, NULL);
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    // Now open the same DB via Store — migration should run.
+    let _store = Store::open(&db_path).expect("migration");
+
+    // Verify the column exists with the expected values.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let logged_in_role: String = conn
+        .query_row(
+            "SELECT role FROM comments WHERE id = 'c_old_logged_in'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let anon_role: String = conn
+        .query_row(
+            "SELECT role FROM comments WHERE id = 'c_old_anon'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(logged_in_role, "user");
+    assert_eq!(anon_role, "guest");
+
+    // is_agent should default to 0 for everything (no agent traffic predates
+    // this migration).
+    let is_agent: i64 = conn
+        .query_row(
+            "SELECT is_agent FROM comments WHERE id = 'c_old_logged_in'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(is_agent, 0);
+}
+
+/// Like spawn_with_auth but takes an owner login to plumb into AuthConfig.
+async fn spawn_with_auth_owner(owner: &str) -> AuthedTest {
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_base = format!("http://{}", mock_addr);
+    let mock_app = axum::Router::new()
+        .route("/login/oauth/authorize", get(mock_authorize))
+        .route("/login/oauth/access_token", post(mock_token))
+        .route("/user", get(mock_user));
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_app).await;
+    });
+
+    let (listener, daemon_base) = bind_listener().await;
+    let cli_token = "test-cli-token-deadbeef".to_string();
+    let auth = AuthConfig {
+        client_id: "test-client".into(),
+        client_secret: "test-secret".into(),
+        callback_url: format!("{}/auth/github/callback", daemon_base),
+        enabled: true,
+        authorize_url: format!("{}/login/oauth/authorize", mock_base),
+        token_url: format!("{}/login/oauth/access_token", mock_base),
+        profile_url: format!("{}/user", mock_base),
+        cli_token: cli_token.clone(),
+        owner_login: Some(owner.to_string()),
+    };
+    let tmp = spawn_daemon_on(listener, Some(Arc::new(auth))).await;
+
+    AuthedTest {
+        daemon_base,
+        cli_token,
+        _tmp: tmp,
+    }
+}
+
+/// Walk the mock OAuth round-trip end-to-end so the browser_client cookie jar
+/// holds an authenticated session. Used by every role-test that needs to act
+/// as a logged-in user.
+async fn oauth_round_trip(http: &reqwest::Client, daemon_base: &str) {
+    let r1 = http
+        .get(format!("{}/login", daemon_base))
+        .send()
+        .await
+        .unwrap();
+    let authorize_url = r1
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let r2 = http.get(&authorize_url).send().await.unwrap();
+    let callback_url = r2
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = http.get(&callback_url).send().await.unwrap();
 }
 
 #[tokio::test]
