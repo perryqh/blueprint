@@ -246,7 +246,7 @@ pub async fn run_foreground(preferred_port: Option<u16>) -> Result<()> {
     let store = Arc::new(Store::open(&db_path()).context("opening sqlite store")?);
     let auth_cfg = crate::auth::AuthConfig::from_env();
 
-    // D3: surface the two role-config misconfigurations loudly. Either branch
+    // Surface the two role-config misconfigurations loudly. Either branch
     // means owner-role assignment is silently broken; an early stderr line
     // saves a confused debug session when comments never trip a plan edit.
     if auth_cfg.enabled && auth_cfg.owner_login.is_none() {

@@ -1297,6 +1297,224 @@ async fn migration_backfills_role_for_existing_logged_in_comments() {
     assert_eq!(is_agent, 0);
 }
 
+// -------------------------------------------------------------------------
+// Batch-processing indicator (slug-level "Claude is working on N comments")
+// See `src/server.rs::BatchProcessing` and the `/batch-processing` endpoints.
+// -------------------------------------------------------------------------
+
+/// Publish a blueprint then create N parent comments on it. Returns the
+/// freshly-minted parent IDs in insertion order. Centralizes the boilerplate
+/// shared by every batch-processing test below — the assertions stay focused
+/// on the indicator's lifecycle, not the setup.
+async fn seed_batch_parents(
+    http: &reqwest::Client,
+    base: &str,
+    slug: &str,
+    n: usize,
+) -> Vec<String> {
+    http.post(format!("{base}/api/blueprints"))
+        .json(&json!({ "html": "<p>x</p>", "slug": slug }))
+        .send()
+        .await
+        .unwrap();
+    let mut ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let c: Value = http
+            .post(format!("{base}/api/blueprints/{slug}/comments"))
+            .json(&json!({
+                "author": "perryqh",
+                "body": format!("parent {i}"),
+                "selector": { "type": "TextQuoteSelector", "exact": "x" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        ids.push(c["id"].as_str().unwrap().to_string());
+    }
+    ids
+}
+
+/// Start endpoint stamps the indicator; the comments-list response surfaces it.
+#[tokio::test]
+async fn batch_processing_start_appears_in_comments_response() {
+    let s = spawn().await;
+    let http = client();
+    let ids = seed_batch_parents(&http, &s.base, "bp1", 1).await;
+
+    let r = http
+        .post(format!("{}/api/blueprints/bp1/batch-processing", s.base))
+        .json(&json!({ "author": "Claude Code", "parent_ids": &ids }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let listing: Value = http
+        .get(format!("{}/api/blueprints/bp1/comments", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bp = &listing["batch_processing"];
+    assert_eq!(bp["author"], "Claude Code");
+    assert_eq!(bp["count"], 1);
+    assert!(bp["started_at"].is_i64());
+}
+
+/// Explicit DELETE clears the indicator.
+#[tokio::test]
+async fn batch_processing_delete_clears_entry() {
+    let s = spawn().await;
+    let http = client();
+    let ids = seed_batch_parents(&http, &s.base, "bp2", 1).await;
+
+    http.post(format!("{}/api/blueprints/bp2/batch-processing", s.base))
+        .json(&json!({ "author": "Claude Code", "parent_ids": &ids }))
+        .send()
+        .await
+        .unwrap();
+
+    let r = http
+        .delete(format!("{}/api/blueprints/bp2/batch-processing", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    let listing: Value = http
+        .get(format!("{}/api/blueprints/bp2/comments", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listing.get("batch_processing").is_none(),
+        "DELETE should clear the entry; got {listing}"
+    );
+}
+
+/// When every parent_id in the batch receives a reply, the indicator clears
+/// server-side without anyone calling DELETE.
+#[tokio::test]
+async fn batch_processing_auto_clears_after_all_parents_replied() {
+    let s = spawn().await;
+    let http = client();
+    let ids = seed_batch_parents(&http, &s.base, "bp3", 2).await;
+
+    http.post(format!("{}/api/blueprints/bp3/batch-processing", s.base))
+        .json(&json!({ "author": "Claude Code", "parent_ids": &ids }))
+        .send()
+        .await
+        .unwrap();
+
+    // First reply: still active (one pending parent left).
+    http.post(format!(
+        "{}/api/blueprints/bp3/comments/{}/replies",
+        s.base, &ids[0]
+    ))
+    .json(&json!({ "author": "Claude Code", "body": "done" }))
+    .send()
+    .await
+    .unwrap();
+    let listing: Value = http
+        .get(format!("{}/api/blueprints/bp3/comments", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listing.get("batch_processing").is_some(),
+        "indicator should still be active after only the first reply"
+    );
+    // count stays at 2 — never decremented; only pending_parents shrinks.
+    assert_eq!(listing["batch_processing"]["count"], 2);
+
+    // Second reply on the last pending parent → indicator clears.
+    http.post(format!(
+        "{}/api/blueprints/bp3/comments/{}/replies",
+        s.base, &ids[1]
+    ))
+    .json(&json!({ "author": "Claude Code", "body": "also done" }))
+    .send()
+    .await
+    .unwrap();
+    let listing: Value = http
+        .get(format!("{}/api/blueprints/bp3/comments", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listing.get("batch_processing").is_none(),
+        "indicator should auto-clear after the last reply lands; got {listing}"
+    );
+}
+
+/// TTL safety net: an entry older than 5 minutes is evicted on read so a
+/// crashed skill can't pin the indicator forever.
+#[tokio::test]
+async fn batch_processing_ttl_evicts_stale_entries() {
+    use blueprint::server::BatchProcessing;
+    use std::collections::HashSet;
+
+    // Reach into AppState directly so we can implant an entry that's already
+    // older than the TTL — no point waiting 5 real minutes in a unit test.
+    let (listener, base) = bind_listener().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        blueprint::store::Store::open(&tmp.path().join("blueprints.db")).expect("open store"),
+    );
+    let state = blueprint::server::AppState::with_auth(store.clone(), None);
+    let app = blueprint::server::router(state.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    store
+        .insert_blueprint("ttl-test", b"<p>x</p>", "tok", None)
+        .unwrap();
+    // Implant a stale entry: started_at is 10 minutes ago.
+    {
+        let mut m = state.batch_processing.lock().await;
+        m.insert(
+            "ttl-test".to_string(),
+            BatchProcessing {
+                author: "Claude Code".to_string(),
+                count: 1,
+                started_at: blueprint::store::now_ms() - 10 * 60 * 1000,
+                pending_parents: HashSet::from(["c_stale".to_string()]),
+            },
+        );
+    }
+    let http = client();
+    let listing: Value = http
+        .get(format!("{}/api/blueprints/ttl-test/comments", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listing.get("batch_processing").is_none(),
+        "stale entry should be evicted on read"
+    );
+    // And the entry should be gone from state too (lazy eviction).
+    let m = state.batch_processing.lock().await;
+    assert!(!m.contains_key("ttl-test"));
+}
+
 /// Like spawn_with_auth but takes an owner login to plumb into AuthConfig.
 async fn spawn_with_auth_owner(owner: &str) -> AuthedTest {
     let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

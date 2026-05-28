@@ -548,9 +548,10 @@ document.getElementById('finish-btn').addEventListener('click', async (e) => {
 async function refreshComments() {
   const r = await fetch(`/api/blueprints/${slug}/comments`);
   if (!r.ok) return;
-  const { comments, server_ts, blueprint_version } = await r.json();
+  const { comments, server_ts, blueprint_version, batch_processing } = await r.json();
   lastTs = server_ts;
   allComments = comments;
+  renderBatchIndicator(batch_processing ?? null);
   if (lastBlueprintVersion === null) lastBlueprintVersion = blueprint_version;
   // Seed auto-scroll bookkeeping so the first poll doesn't mistake existing
   // comments for new arrivals.
@@ -567,8 +568,9 @@ async function pollOnce() {
     // comments — processing flags going on/off, resolve toggles — actually propagate.
     const r = await fetch(`/api/blueprints/${slug}/comments`);
     if (!r.ok) return;
-    const { comments, server_ts, blueprint_version } = await r.json();
+    const { comments, server_ts, blueprint_version, batch_processing } = await r.json();
     lastTs = server_ts;
+    renderBatchIndicator(batch_processing ?? null);
 
     // If the server has a newer plan version than what we've loaded, show a banner
     // instead of auto-reloading (preserves scroll position and reading state).
@@ -1001,6 +1003,49 @@ function scrollFrameToQuote(quote) {
   });
 }
 
+/* The rotating ✦ sparkle used by both the per-comment "X is replying" pill
+   in renderComment and the slug-level batch-processing indicator. SVG is
+   identical in both spots; consolidating prevents the two from drifting. */
+function makeSparkleSvg() {
+  const sparkle = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  sparkle.setAttribute('class', 'sparkle sparkle--spin');
+  sparkle.setAttribute('viewBox', '0 0 24 24');
+  sparkle.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M 12 2 L 13.5 10.5 L 22 12 L 13.5 13.5 L 12 22 L 10.5 13.5 L 2 12 L 10.5 10.5 Z');
+  sparkle.appendChild(path);
+  return sparkle;
+}
+
+// Last rendered batch_processing payload, kept as a JSON-comparable signature
+// so the 1.5s sidebar poll doesn't tear down + rebuild the indicator when
+// nothing actually changed.
+let lastBatchProcessingKey = null;
+
+/* Slug-level "Claude is working on N comments" pill — server `batch_processing`
+   field, set by `blueprint batch-processing start` and cleared on the last
+   reply or after PROCESSING_TTL_MS. */
+function renderBatchIndicator(bp) {
+  const el = document.getElementById('batch-indicator');
+  if (!el) return;
+  const active = bp && (Date.now() - bp.started_at) < PROCESSING_TTL_MS;
+  const key = active ? `${bp.author}|${bp.count}|${bp.started_at}` : null;
+  if (key === lastBatchProcessingKey) return;
+  lastBatchProcessingKey = key;
+  if (!active) {
+    el.hidden = true;
+    el.innerHTML = '';
+    return;
+  }
+  const noun = bp.count === 1 ? 'comment' : 'comments';
+  el.innerHTML = '';
+  el.appendChild(makeSparkleSvg());
+  const msg = document.createElement('span');
+  msg.innerHTML = `<strong>${escapeHtml(bp.author)}</strong> is working on ${bp.count} ${noun}`;
+  el.appendChild(msg);
+  el.hidden = false;
+}
+
 function renderComment(c, replies, byParent) {
   const wrap = document.createElement('div');
   // Role-based outline: owner gets a solid accent border, guest a dashed muted
@@ -1056,17 +1101,7 @@ function renderComment(c, replies, byParent) {
       const msg = document.createElement('span');
       msg.innerHTML = `<strong>${escapeHtml(c.processing_by)}</strong> is replying`;
       working.appendChild(msg);
-      // ✦ accent — matches the Gemini brand sparkle; slowly rotates to read
-      // as "in progress" without the dot-pulse rhythm fighting the rest of
-      // the UI. SVG inline so it inherits color from the working-indicator.
-      const sparkle = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      sparkle.setAttribute('class', 'sparkle sparkle--spin');
-      sparkle.setAttribute('viewBox', '0 0 24 24');
-      sparkle.setAttribute('aria-hidden', 'true');
-      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      path.setAttribute('d', 'M 12 2 L 13.5 10.5 L 22 12 L 13.5 13.5 L 12 22 L 10.5 13.5 L 2 12 L 10.5 10.5 Z');
-      sparkle.appendChild(path);
-      working.appendChild(sparkle);
+      working.appendChild(makeSparkleSvg());
       wrap.appendChild(working);
     }
   }

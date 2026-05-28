@@ -40,6 +40,19 @@ fn read_cli_token() -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+/// Drain a non-success `reqwest::Response` into an `anyhow::Error` with the
+/// status code AND the response body, so the CLI surfaces a useful error
+/// instead of just "400 Bad Request". Returns `Ok(resp)` on success so calls
+/// can chain through to `.json()` etc.
+async fn ensure_success(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    bail!("{what} failed: {status} {body}")
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "blueprint",
@@ -110,6 +123,31 @@ pub enum Cmd {
     },
     /// Remove a blueprint and its comments. If no blueprints remain, the daemon stops.
     Unpublish { slug: String },
+    /// Mark a Submit-all batch as actively being worked on by the agent.
+    /// Lights the slug-level "Claude is working on N comments" pill in the
+    /// sidebar. Auto-clears when every parent_id receives a reply.
+    #[command(subcommand)]
+    BatchProcessing(BatchProcessingCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BatchProcessingCmd {
+    /// Start the indicator. Pass every comment ID the agent is about to work
+    /// through as a `--parent` flag (repeatable). The set is server-tracked
+    /// so the indicator auto-clears when the last reply lands.
+    Start {
+        slug: String,
+        /// Author shown in the indicator pill. Defaults to "Claude Code".
+        #[arg(long, default_value = "Claude Code")]
+        author: String,
+        /// Parent comment ID. Pass once per comment in the batch.
+        #[arg(long = "parent", value_name = "ID", required = true)]
+        parents: Vec<String>,
+    },
+    /// Stop the indicator explicitly. Belt-and-braces — the server already
+    /// auto-clears after the last reply. Use on early-exit paths (no edit,
+    /// no replies) to avoid waiting for the 5-min TTL.
+    End { slug: String },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -133,7 +171,57 @@ pub async fn run(cli: Cli) -> Result<()> {
             author,
         } => comment(slug, body, quote, reply_to, author).await,
         Cmd::Unpublish { slug } => unpublish(slug).await,
+        Cmd::BatchProcessing(BatchProcessingCmd::Start {
+            slug,
+            author,
+            parents,
+        }) => batch_processing_start(slug, author, parents).await,
+        Cmd::BatchProcessing(BatchProcessingCmd::End { slug }) => batch_processing_end(slug).await,
     }
+}
+
+async fn batch_processing_start(slug: String, author: String, parents: Vec<String>) -> Result<()> {
+    let info = require_running()?;
+    let client = cli_http_client();
+    #[derive(Serialize)]
+    struct Body<'a> {
+        author: &'a str,
+        parent_ids: &'a [String],
+    }
+    let resp = client
+        .post(format!(
+            "{}/api/blueprints/{}/batch-processing",
+            base_url(&info),
+            slug
+        ))
+        .json(&Body {
+            author: &author,
+            parent_ids: &parents,
+        })
+        .send()
+        .await?;
+    ensure_success(resp, "batch-processing start").await?;
+    println!(
+        "started batch-processing for {slug} on {} comment{}",
+        parents.len(),
+        if parents.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+async fn batch_processing_end(slug: String) -> Result<()> {
+    let info = require_running()?;
+    let resp = cli_http_client()
+        .delete(format!(
+            "{}/api/blueprints/{}/batch-processing",
+            base_url(&info),
+            slug
+        ))
+        .send()
+        .await?;
+    ensure_success(resp, "batch-processing end").await?;
+    println!("stopped batch-processing for {slug}");
+    Ok(())
 }
 
 async fn current_exe() -> Result<PathBuf> {

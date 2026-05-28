@@ -198,22 +198,27 @@ Call the **Monitor** tool on the bash_id from Step 3. The reviewer UI stages dra
 **Batch reactions, not per-comment reactions.** When N comments arrive together (same or near-same `created_at`), treat them as one review round:
 
 1. **Collect** all comments from the burst before doing any work. A 200ms quiet window after the last line is a safe boundary — anything later is a separate batch. Drop any line with `is_agent: true` — those are your own replies echoing back.
-2. **Triage the whole batch.** For each comment:
+2. **Light the indicator.** Immediately POST the batch IDs to `batch-processing` so the sidebar shows "Claude is working on N comments" while you triage. The server auto-clears the indicator when the last reply lands.
+   ```bash
+   blueprint batch-processing start <slug> --parent <id1> --parent <id2> ...
+   ```
+   Pass every collected `c.id` as a `--parent` flag. Author defaults to "Claude Code".
+3. **Triage the whole batch.** For each comment:
    - `c.role == "owner"` AND the comment proposes a plan change → queue an HTML edit AND a reply.
    - `c.role == "owner"` AND the comment is a question / ack / pushback request → reply only.
    - `c.role == "user"` or `c.role == "guest"` → **reply only, never edit.** Acknowledge the suggestion; if it's a good idea, say so and surface it for the owner ("good catch — flagging for the owner to decide"). The owner is the one driving Claude; non-owner suggestions go through them.
    - `parent_id` set → still respect the role rules above; usually a reply on an existing thread is clarification, not a change.
-3. **Make one HTML edit pass** covering every required change from the **owner's** comments in the batch. Use the `Edit` tool, locating each `selector.exact` in the file. Skip the edit pass entirely if the batch contained no owner-authored change requests.
-4. **Re-publish once** for the whole batch (only if you actually edited the HTML):
+4. **Make one HTML edit pass** covering every required change from the **owner's** comments in the batch. Use the `Edit` tool, locating each `selector.exact` in the file. Skip the edit pass entirely if the batch contained no owner-authored change requests.
+5. **Re-publish once** for the whole batch (only if you actually edited the HTML):
    ```bash
    blueprint publish ~/.blueprint/drafts/<slug>.html --slug <slug> --update --no-open --json
    ```
    The browser shows a "Plan updated" banner; the reviewer keeps their scroll position and refreshes when ready.
-5. **Reply once per comment.** Replies always go out — the reviewer always hears back, even when their comment didn't change the plan. Post sequentially after the single `--update`:
+6. **Reply once per comment.** Replies always go out — the reviewer always hears back, even when their comment didn't change the plan. Post sequentially after the single `--update`:
    ```bash
    blueprint comment <slug> --reply-to <comment_id> --author 'Claude Code' '<markdown reply>'
    ```
-   For owner edits, the reply explains what changed. For non-owner comments, the reply explains why no edit was made (e.g. "good idea — flagging for the owner"). Reply bodies support Markdown. Don't pass `--resolve` — that's the reviewer's call.
+   For owner edits, the reply explains what changed. For non-owner comments, the reply explains why no edit was made (e.g. "good idea — flagging for the owner"). Reply bodies support Markdown. Don't pass `--resolve` — that's the reviewer's call. The batch-processing indicator auto-clears once the last reply has landed — no explicit cleanup needed for the happy path. Only call `blueprint batch-processing end <slug>` on early-exit paths (no edits AND no replies will be posted) to avoid waiting for the 5-min TTL.
 
 **Why batch-first.** A single Submit-all click in the UI maps to one POST `/api/blueprints/:slug/comments/batch` + one `CommentBatchAdded` broadcast. The agent posting 5 separate `--update`s for a single Submit click is the noisy anti-pattern this UX is built to avoid. Always edit-then-republish *before* replying — otherwise the reviewer reads "fixed!" on a stale blueprint.
 
@@ -241,13 +246,15 @@ One or two sentences. What the blueprint covered, where the HTML lives (`~/.blue
 
 ```bash
 blueprint publish <file.html> --no-open --json [--slug <s>] [--update]
-blueprint watch <slug> --stream                   # one JSON comment per line, line-flushed
-blueprint watch <slug>                            # blocks until reviewer clicks Finish
+blueprint watch <slug> --stream                                          # one JSON comment per line, line-flushed
+blueprint watch <slug>                                                   # blocks until reviewer clicks Finish
 blueprint comment <slug> --reply-to <id> --author 'Claude Code' '<body>'
 blueprint comment <slug> --quote '<text>' --author 'Claude Code' '<body>'
-blueprint fetch <slug>                            # writes ./.blueprint/<slug>/review.json
-blueprint status                                  # daemon URL, active plans
-blueprint unpublish <slug>                        # daemon stops when no plans remain
+blueprint batch-processing start <slug> --parent <id> [--parent <id>...]  # lights the slug-level "Claude is working on N comments" pill
+blueprint batch-processing end <slug>                                     # explicit clear (early-exit only; auto-clears after replies)
+blueprint fetch <slug>                                                    # writes ./.blueprint/<slug>/review.json
+blueprint status                                                          # daemon URL, active plans
+blueprint unpublish <slug>                                                # daemon stops when no plans remain
 ```
 
 Comment shape lives in `src/store.rs`. Stream endpoint is `GET /api/blueprints/:slug/wait-comment?since=<ts>` (long-poll, ~30s timeout). Port resolution lives in `src/daemon.rs::resolve_port` — defaults to 7321 (registered OAuth callback port), overridable via `--port` / `BLUEPRINT_PORT`.

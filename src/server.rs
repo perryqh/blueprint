@@ -11,10 +11,16 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, broadcast};
+
+/// 5-minute TTL on a slug-level batch-processing entry. If the skill crashes
+/// between `start` and the last reply (and so never DELETE'd), the entry is
+/// lazily evicted on the next read. Mirrors the per-comment processing TTL on
+/// the frontend (`PROCESSING_TTL_MS` in `frontend/app.js`).
+const BATCH_PROCESSING_TTL_MS: i64 = 5 * 60 * 1000;
 
 #[derive(RustEmbed)]
 #[folder = "frontend/"]
@@ -26,12 +32,39 @@ pub struct AppState {
     pub events: broadcast::Sender<Event>,
     pub finish_signals: Arc<Mutex<HashMap<String, broadcast::Sender<()>>>>,
     pub blueprint_versions: Arc<Mutex<HashMap<String, u64>>>,
+    /// Per-slug "the agent is working on this batch" state, in-memory only.
+    /// Set by `POST /api/blueprints/:slug/batch-processing` when the skill
+    /// wakes on a Submit-all batch, cleared either explicitly via DELETE or
+    /// implicitly when the last comment in `pending_parents` receives a reply.
+    /// See `BatchProcessing` below.
+    pub batch_processing: Arc<Mutex<HashMap<String, BatchProcessing>>>,
     /// None when auth env vars aren't set (legacy local-trust mode).
     pub auth: Option<Arc<crate::auth::AuthConfig>>,
     /// Notified by `POST /api/shutdown-if-empty` when there are no blueprints left.
     /// `daemon::run_foreground` selects on this alongside ctrl-c/SIGTERM so
     /// the HTTP-triggered shutdown reuses axum's graceful-shutdown path.
     pub shutdown: Arc<Notify>,
+}
+
+/// Slug-level "Claude is working on N comments" state. Lives only in memory
+/// on `AppState`; surviving a daemon restart isn't worth the schema cost —
+/// worst case the indicator reappears stale for at most `BATCH_PROCESSING_TTL_MS`.
+#[derive(Clone, Debug, Serialize)]
+pub struct BatchProcessing {
+    pub author: String,
+    /// Original batch size, displayed verbatim by the sidebar pill. Stays
+    /// constant for the lifetime of the entry — the goal of the indicator is
+    /// "is Claude working" not a per-reply progress meter, so a stable label
+    /// reads more cleanly than one that ticks down.
+    pub count: u32,
+    pub started_at: i64,
+    /// Set of parent comment IDs that haven't yet received a reply. Removed
+    /// from on each matching reply-insert; when empty, the entry is cleared
+    /// and a `BatchProcessingChanged` event is broadcast (auto-clear path).
+    /// Skipped in serialization — the wire payload only needs `author`,
+    /// `count`, `started_at`.
+    #[serde(skip)]
+    pub pending_parents: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +83,11 @@ pub enum EventKind {
     CommentBatchAdded(Vec<String>),
     BlueprintUpdated,
     BlueprintDeleted,
+    /// The slug's batch-processing entry was set, cleared, or auto-cleared
+    /// after the last pending reply. The actual payload is read off
+    /// `AppState::batch_processing`; this is just the wake signal for
+    /// long-pollers and the comment-stream.
+    BatchProcessingChanged,
 }
 
 impl AppState {
@@ -64,8 +102,64 @@ impl AppState {
             events: tx,
             finish_signals: Arc::new(Mutex::new(HashMap::new())),
             blueprint_versions: Arc::new(Mutex::new(HashMap::new())),
+            batch_processing: Arc::new(Mutex::new(HashMap::new())),
             auth,
             shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Read the active batch-processing entry for a slug, applying the TTL.
+    /// If the recorded `started_at` is older than `BATCH_PROCESSING_TTL_MS`,
+    /// the entry is evicted on-the-fly and `None` is returned — saves a
+    /// background sweep for what's a rare crash-recovery path.
+    pub async fn current_batch_processing(&self, slug: &str) -> Option<BatchProcessing> {
+        let mut m = self.batch_processing.lock().await;
+        let entry = m.get(slug)?.clone();
+        let age = crate::store::now_ms() - entry.started_at;
+        if age > BATCH_PROCESSING_TTL_MS {
+            m.remove(slug);
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// Single-reply version of `note_replies_in_batch`. Inline so the common
+    /// `create_comment` / `create_reply` path doesn't need to build a slice.
+    pub async fn note_reply_in_batch(&self, slug: &str, parent_id: &str) {
+        self.note_replies_in_batch(slug, &[parent_id]).await;
+    }
+
+    /// Mark a set of comments in this slug's active batch (if any) as having
+    /// received their replies. If the batch's `pending_parents` set empties
+    /// as a result, the entry is cleared and a `BatchProcessingChanged` event
+    /// broadcast so the next 1.5s sidebar poll hides the indicator. No-op if
+    /// there's no active batch or none of the parents are in it. Takes the
+    /// mutex once for the whole slice.
+    pub async fn note_replies_in_batch(&self, slug: &str, parent_ids: &[&str]) {
+        if parent_ids.is_empty() {
+            return;
+        }
+        let cleared = {
+            let mut m = self.batch_processing.lock().await;
+            if let Some(entry) = m.get_mut(slug) {
+                for pid in parent_ids {
+                    entry.pending_parents.remove(*pid);
+                }
+                if entry.pending_parents.is_empty() {
+                    m.remove(slug);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if cleared {
+            let _ = self.events.send(Event {
+                slug: slug.to_string(),
+                kind: EventKind::BatchProcessingChanged,
+            });
         }
     }
 
@@ -134,6 +228,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/blueprints/:slug/finish", post(finish_review))
         .route("/api/blueprints/:slug/wait", get(wait_for_finish))
         .route("/api/blueprints/:slug/wait-comment", get(wait_for_comment))
+        .route(
+            "/api/blueprints/:slug/batch-processing",
+            post(start_batch_processing).delete(end_batch_processing),
+        )
         // Auth surface
         .route("/login", get(crate::auth::login))
         .route("/auth/github/callback", get(crate::auth::callback))
@@ -322,13 +420,26 @@ async fn list_comments(
         return Err(AppError::NotFound);
     }
     let comments = state.store.list_comments(&slug, q.since)?;
+    Ok(Json(build_comments_response(&state, &slug, comments).await))
+}
+
+/// Stamp comments with the trio of slug-scoped facts that every comments-list
+/// response carries: `server_ts`, `blueprint_version`, and `batch_processing`.
+/// Used by `list_comments` and by every return-arm of `wait_for_comment`.
+async fn build_comments_response(
+    state: &AppState,
+    slug: &str,
+    comments: Vec<Comment>,
+) -> CommentsResponse {
     let server_ts = crate::store::now_ms();
-    let blueprint_version = state.blueprint_version(&slug).await;
-    Ok(Json(CommentsResponse {
+    let blueprint_version = state.blueprint_version(slug).await;
+    let batch_processing = state.current_batch_processing(slug).await;
+    CommentsResponse {
         comments,
         server_ts,
         blueprint_version,
-    }))
+        batch_processing,
+    }
 }
 
 #[derive(Serialize)]
@@ -336,6 +447,12 @@ struct CommentsResponse {
     comments: Vec<Comment>,
     server_ts: i64,
     blueprint_version: u64,
+    /// `Some(_)` while a Submit-all batch is being worked on by the agent;
+    /// `None` otherwise. Drives the slug-level "Claude is working on N
+    /// comments" pill in the sidebar. Field is `skip_serializing_if = None`
+    /// so older clients that don't know about it see the same shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_processing: Option<BatchProcessing>,
 }
 
 #[derive(Deserialize)]
@@ -385,6 +502,9 @@ async fn create_comment(
         role,
         is_agent,
     )?;
+    if let Some(pid) = &input.parent_id {
+        state.note_reply_in_batch(&slug, pid).await;
+    }
     let _ = state.events.send(Event {
         slug: slug.clone(),
         kind: EventKind::CommentAdded(id),
@@ -479,6 +599,18 @@ async fn create_comments_batch(
         .collect();
 
     let comments = state.store.add_comments_batch(&slug, &drafts)?;
+    // Any drafts in this batch that ARE replies (parent_id set) may settle
+    // pending entries on this slug's active batch-processing record. The user-
+    // facing Submit-all flow doesn't mix replies into a batch — but the
+    // /batch endpoint is generic, so still call through for correctness.
+    // One acquisition for the whole batch instead of N.
+    let parent_ids: Vec<&str> = comments
+        .iter()
+        .filter_map(|c| c.parent_id.as_deref())
+        .collect();
+    if !parent_ids.is_empty() {
+        state.note_replies_in_batch(&slug, &parent_ids).await;
+    }
     let ids: Vec<String> = comments.iter().map(|c| c.id.clone()).collect();
     let _ = state.events.send(Event {
         slug: slug.clone(),
@@ -524,6 +656,7 @@ async fn create_reply(
         role,
         is_agent,
     )?;
+    state.note_reply_in_batch(&slug, &parent_id).await;
     let _ = state.events.send(Event {
         slug: slug.clone(),
         kind: EventKind::CommentAdded(id),
@@ -598,6 +731,76 @@ async fn wait_for_finish(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct StartBatchProcessingInput {
+    author: String,
+    /// Comment IDs the agent is about to work through. Their count drives
+    /// the sidebar pill's "N comments" wording (displayed verbatim, never
+    /// decremented). As replies land for each ID, the entry's pending set
+    /// shrinks; when empty, the entry is auto-cleared without an explicit
+    /// DELETE from the agent.
+    parent_ids: Vec<String>,
+}
+
+/// `POST /api/blueprints/:slug/batch-processing` — stamp the slug-level
+/// "Claude is working on N comments" state on `AppState`. Called by the
+/// `/blueprint` skill at the top of its triage pass on a Submit-all batch.
+async fn start_batch_processing(
+    State(state): State<AppState>,
+    _w: crate::auth::WriteIdentity,
+    Path(slug): Path<String>,
+    Json(input): Json<StartBatchProcessingInput>,
+) -> Result<Json<BatchProcessing>, AppError> {
+    if state.store.get_blueprint(&slug)?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    if input.author.trim().is_empty() {
+        return Err(AppError::BadRequest("author is required".into()));
+    }
+    if input.parent_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "parent_ids must contain at least one comment id".into(),
+        ));
+    }
+    let pending_parents: HashSet<String> = input.parent_ids.iter().cloned().collect();
+    let entry = BatchProcessing {
+        author: input.author.trim().to_string(),
+        count: pending_parents.len() as u32,
+        started_at: crate::store::now_ms(),
+        pending_parents,
+    };
+    {
+        let mut m = state.batch_processing.lock().await;
+        m.insert(slug.clone(), entry.clone());
+    }
+    let _ = state.events.send(Event {
+        slug: slug.clone(),
+        kind: EventKind::BatchProcessingChanged,
+    });
+    Ok(Json(entry))
+}
+
+/// `DELETE /api/blueprints/:slug/batch-processing` — explicit clear. Mostly
+/// belt-and-braces now that the auto-clear path handles the success case;
+/// useful when the skill exits early (no edits AND no replies needed).
+async fn end_batch_processing(
+    State(state): State<AppState>,
+    _w: crate::auth::WriteIdentity,
+    Path(slug): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let removed = {
+        let mut m = state.batch_processing.lock().await;
+        m.remove(&slug).is_some()
+    };
+    if removed {
+        let _ = state.events.send(Event {
+            slug: slug.clone(),
+            kind: EventKind::BatchProcessingChanged,
+        });
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Long-poll endpoint that blocks until a new comment arrives on this blueprint.
 /// Returns immediately if comments exist after `since`. Returns empty after ~30s
 /// so clients can reconnect cleanly. Subscribes to the event stream BEFORE the
@@ -617,13 +820,7 @@ async fn wait_for_comment(
     // Fast path: comments since `since` already exist.
     let existing = state.store.list_comments(&slug, Some(since))?;
     if !existing.is_empty() {
-        let server_ts = crate::store::now_ms();
-        let blueprint_version = state.blueprint_version(&slug).await;
-        return Ok(Json(CommentsResponse {
-            comments: existing,
-            server_ts,
-            blueprint_version,
-        }));
+        return Ok(Json(build_comments_response(&state, &slug, existing).await));
     }
 
     // Slow path: wait for the next CommentAdded event for this slug.
@@ -633,13 +830,7 @@ async fn wait_for_comment(
     loop {
         tokio::select! {
             _ = &mut timeout => {
-                let server_ts = crate::store::now_ms();
-                let blueprint_version = state.blueprint_version(&slug).await;
-                return Ok(Json(CommentsResponse {
-                    comments: vec![],
-                    server_ts,
-                    blueprint_version,
-                }));
+                return Ok(Json(build_comments_response(&state, &slug, vec![]).await));
             }
             ev = rx.recv() => {
                 match ev {
@@ -648,29 +839,18 @@ async fn wait_for_comment(
                             EventKind::CommentAdded(_) | EventKind::CommentBatchAdded(_) => {
                                 let comments = state.store.list_comments(&slug, Some(since))?;
                                 if !comments.is_empty() {
-                                    let server_ts = crate::store::now_ms();
-                                    let blueprint_version = state.blueprint_version(&slug).await;
-                                    return Ok(Json(CommentsResponse {
-                                        comments,
-                                        server_ts,
-                                        blueprint_version,
-                                    }));
+                                    return Ok(Json(build_comments_response(&state, &slug, comments).await));
                                 }
                             }
                             EventKind::BlueprintDeleted => return Err(AppError::NotFound),
                             EventKind::BlueprintUpdated => {}
+                            EventKind::BatchProcessingChanged => {}
                         }
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        let server_ts = crate::store::now_ms();
-                        let blueprint_version = state.blueprint_version(&slug).await;
-                        return Ok(Json(CommentsResponse {
-                            comments: vec![],
-                            server_ts,
-                            blueprint_version,
-                        }));
+                        return Ok(Json(build_comments_response(&state, &slug, vec![]).await));
                     }
                 }
             }

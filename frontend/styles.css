@@ -877,7 +877,8 @@ iframe#blueprint-frame {
 .comments .reply-form button:hover { background: var(--color-info-strong); }
 
 /* "Claude is replying…" */
-.working-indicator {
+.working-indicator,
+.batch-indicator {
   background: var(--color-accent-bg);
   border: 1px dashed var(--color-accent);
   border-radius: var(--radius-md);
@@ -889,8 +890,9 @@ iframe#blueprint-frame {
   align-items: center;
   gap: var(--space-3);
 }
+.working-indicator strong,
+.batch-indicator strong { color: var(--color-accent); }
 .working-indicator .avatar { width: 16px; height: 16px; font-size: 8px; }
-.working-indicator strong { color: var(--color-accent); }
 .working-indicator .dots-pulse {
   display: inline-flex;
   gap: 3px;
@@ -1433,3 +1435,11 @@ dialog.shortcuts-dialog button {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
 }
+
+/* Slug-level "Claude is working on N comments" pill — shares layout with
+   `.working-indicator` above; only the sparkle size + hidden override are
+   unique here. Without the `[hidden]` rule, author CSS's `display: flex`
+   beats the HTML `hidden` attribute and an empty slot renders as a thin
+   accent-bordered strip. */
+.batch-indicator[hidden] { display: none; }
+.batch-indicator .sparkle { width: 14px; height: 14px; }

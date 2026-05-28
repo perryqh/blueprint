@@ -202,7 +202,7 @@ impl Store {
             }
         }
 
-        // D4: atomic ALTER + backfill for the `role` column. If we crashed
+        // Atomic ALTER + backfill for the `role` column. If we crashed
         // between the ALTER and the UPDATE on a non-transactional migration,
         // the next startup would see the column present and skip the backfill
         // entirely, stranding every pre-existing logged-in comment as `guest`.

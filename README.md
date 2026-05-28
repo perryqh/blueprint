@@ -150,6 +150,8 @@ blueprint unpublish <slug>                       # daemon stops when no blueprin
 
 **Roles and the write gate.** Every comment is server-stamped with a `role` (`owner` / `user` / `guest`) and an `is_agent` boolean derived from the request's identity at write time (see `src/auth.rs::role_for` and `::is_agent`). The Claude skill keys its triage off `c.role` — only `owner` comments trigger plan edits; everyone else gets a reply only. There is no 401 gate on anonymous writes: the daemon is localhost-only and provenance via the `role` tag is the defense. See Step 3 above for the env-var configuration.
 
+**Batch-processing indicator.** When the skill wakes on a Submit-all batch, it calls `blueprint batch-processing start <slug> --parent <id>...` to light a slug-level "Claude is working on N comments" pill in the sidebar. The server tracks the batch's `pending_parents` and auto-clears the pill when the last reply lands — no explicit DELETE needed on the happy path. A 5-minute TTL evicts stale entries if the skill crashes mid-batch.
+
 ## HTTP API
 
 The CLI is a thin wrapper over a REST API at `http://127.0.0.1:7321`:
@@ -170,8 +172,10 @@ The CLI is a thin wrapper over a REST API at `http://127.0.0.1:7321`:
 | `DELETE` | `/api/blueprints/:slug`                             | Unpublish                                                                  |
 | `POST`   | `/api/shutdown-if-empty`                            | Server-side count-and-stop; safe under concurrent publish                  |
 | `GET`    | `/api/me`                                           | `{ id, login, name, avatar_url, is_owner }` or 401 — used by the chrome    |
+| `POST`   | `/api/blueprints/:slug/batch-processing`            | `{ "author": "Claude Code", "parent_ids": [...] }` — light the indicator   |
+| `DELETE` | `/api/blueprints/:slug/batch-processing`            | Clear the indicator. Mostly redundant — the server auto-clears on replies  |
 
-Every `Comment` returned by the API includes `role` (`"owner" | "user" | "guest"`) and `is_agent` (boolean) alongside `author`, `body`, `selector`, etc. — both fields are server-stamped from the request's identity, not from anything the client sends.
+Every `Comment` returned by the API includes `role` (`"owner" | "user" | "guest"`) and `is_agent` (boolean) alongside `author`, `body`, `selector`, etc. — both fields are server-stamped from the request's identity, not from anything the client sends. The comments-list response also includes an optional `batch_processing: { author, count, started_at }` while the agent is working on a Submit-all batch.
 
 ## Architecture
 
