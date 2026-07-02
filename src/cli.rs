@@ -13,7 +13,7 @@ use std::time::Duration;
 /// If the file is missing or empty, the client sends no auth header (legacy mode).
 /// Also sets `X-Client-Cwd` to the current working directory so the daemon can
 /// surface which repo published a blueprint in `blueprint status`.
-fn cli_http_client() -> reqwest::Client {
+pub(crate) fn cli_http_client() -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(token) = read_cli_token()
         && let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
@@ -128,6 +128,11 @@ pub enum Cmd {
     /// sidebar. Auto-clears when every parent_id receives a reply.
     #[command(subcommand)]
     BatchProcessing(BatchProcessingCmd),
+    /// Run a stdio MCP server so any MCP-capable agent can drive blueprint
+    /// (publish / update / wait-for-comments / reply / list) without the
+    /// `/blueprint` skill. Speaks JSON-RPC 2.0 over stdin/stdout; wraps the
+    /// same daemon HTTP API the CLI uses, auto-spawning the daemon on publish.
+    Mcp,
 }
 
 #[derive(Subcommand, Debug)]
@@ -177,6 +182,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             parents,
         }) => batch_processing_start(slug, author, parents).await,
         Cmd::BatchProcessing(BatchProcessingCmd::End { slug }) => batch_processing_end(slug).await,
+        Cmd::Mcp => crate::mcp::run().await,
     }
 }
 
@@ -228,12 +234,12 @@ async fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("could not resolve current_exe")
 }
 
-async fn ensure_daemon() -> Result<LockInfo> {
+pub(crate) async fn ensure_daemon() -> Result<LockInfo> {
     let exe = current_exe().await?;
     daemon::ensure_running(&exe).await
 }
 
-fn base_url(info: &LockInfo) -> String {
+pub(crate) fn base_url(info: &LockInfo) -> String {
     format!("http://127.0.0.1:{}", info.port)
 }
 
@@ -726,7 +732,7 @@ async fn unpublish(slug: String) -> Result<()> {
     Ok(())
 }
 
-fn require_running() -> Result<LockInfo> {
+pub(crate) fn require_running() -> Result<LockInfo> {
     daemon::discover_running().ok_or_else(|| {
         anyhow::anyhow!("blueprint daemon is not running (try `blueprint publish` first)")
     })
