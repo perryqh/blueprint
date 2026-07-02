@@ -10,6 +10,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("unauthorized")]
     Unauthorized,
+    #[error("too many concurrent connections")]
+    TooManyConnections,
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -26,6 +28,7 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::TooManyConnections => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
         (status, msg).into_response()

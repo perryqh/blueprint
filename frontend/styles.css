@@ -786,6 +786,22 @@ iframe#blueprint-frame {
   color: var(--color-fg-faint);
   border: 1px dashed var(--color-border-strong);
 }
+.comments .version-badge {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  padding: 1px 6px;
+  border-radius: 10px;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  background: var(--color-warn-bg, transparent);
+  color: var(--color-warn-fg, var(--color-fg-faint));
+  border: 1px solid var(--color-warn-border, var(--color-border-strong));
+  text-decoration: none;
+  white-space: nowrap;
+}
+.comments .version-badge:hover {
+  text-decoration: underline;
+}
 .comments .comment.is-owner {
   border-left: 3px solid var(--color-accent);
   padding-left: var(--space-2);

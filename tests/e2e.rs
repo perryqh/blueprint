@@ -779,6 +779,7 @@ fn test_comment(
         author_avatar_url: None,
         role: blueprint::store::AuthorRole::Guest,
         is_agent: false,
+        blueprint_version: None,
     }
 }
 

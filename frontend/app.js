@@ -273,6 +273,13 @@ function injectFrameStyles(doc) {
   const style = doc.createElement('style');
   style.id = 'ps-injected-styles';
   style.textContent = `
+    span[data-ps-hl], span[data-ps-hl] * {
+      /* The highlight background is always a light yellow, so force dark text
+         (and any nested colored text) to stay legible on it — plan HTML with
+         white/light type would otherwise wash out. */
+      color: #1c1917 !important;
+      -webkit-text-fill-color: #1c1917 !important;
+    }
     span[data-ps-hl] {
       background-color: ${bg} !important;
       box-shadow: 0 0 0 1px ${bd} !important;
@@ -1080,6 +1087,24 @@ function renderComment(c, replies, byParent) {
   ts.textContent = timeAgo(c.created_at);
   ts.title = new Date(c.created_at).toLocaleString();
   author.appendChild(ts);
+  // Version badge: this comment was authored against an older snapshot than
+  // the one currently rendered in the iframe. Link to that exact snapshot
+  // (served with a no-store sandbox) so the reviewer can see the text it
+  // anchored to — the plan may have since edited that passage away.
+  if (
+    c.blueprint_version != null &&
+    lastBlueprintVersion != null &&
+    c.blueprint_version < lastBlueprintVersion
+  ) {
+    const vb = document.createElement('a');
+    vb.className = 'version-badge';
+    vb.textContent = `on v${c.blueprint_version}`;
+    vb.href = `/api/blueprints/${slug}/raw?version=${c.blueprint_version}`;
+    vb.target = '_blank';
+    vb.rel = 'noopener';
+    vb.title = `Authored against version ${c.blueprint_version}; you're viewing v${lastBlueprintVersion}. Open that snapshot in a new tab.`;
+    author.appendChild(vb);
+  }
   wrap.appendChild(author);
   const body = document.createElement('div');
   body.className = 'body';
