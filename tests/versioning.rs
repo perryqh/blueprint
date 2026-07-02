@@ -142,6 +142,18 @@ async fn update_archives_prior_html_and_pins_comment_versions() {
         .unwrap();
     assert!(v2.contains("REVISED TEXT"), "explicit v2 = live");
 
+    // The versions endpoint lists both versions and marks the current one.
+    let versions: Value = http
+        .get(format!("{}/api/blueprints/vtest/versions", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(versions["current"], 2);
+    assert_eq!(versions["versions"], json!([1, 2]));
+
     // A comment authored after the update is stamped v2.
     let c2: Value = http
         .post(format!("{}/api/blueprints/vtest/comments", s.base))

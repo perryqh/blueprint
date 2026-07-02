@@ -396,6 +396,36 @@ impl Store {
         Ok(v.map(|n| n as u64))
     }
 
+    /// All version numbers for a blueprint (archived + the live one),
+    /// ascending. Empty for an unknown slug. Backs the reviewer's version
+    /// dropdown.
+    pub fn list_versions(&self, slug: &str) -> Result<Vec<u64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let current: Option<i64> = conn
+            .query_row(
+                "SELECT version FROM blueprints WHERE slug = ?1",
+                params![slug],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(vec![]);
+        };
+        let mut stmt = conn.prepare(
+            "SELECT version FROM blueprint_versions WHERE slug = ?1 ORDER BY version ASC",
+        )?;
+        let rows = stmt.query_map(params![slug], |r| r.get::<_, i64>(0))?;
+        let mut versions: Vec<i64> = Vec::new();
+        for r in rows {
+            versions.push(r?);
+        }
+        // The live version isn't copied into the archive, so add it explicitly.
+        versions.push(current);
+        versions.sort_unstable();
+        versions.dedup();
+        Ok(versions.into_iter().map(|v| v as u64).collect())
+    }
+
     /// HTML for a specific version. Serves the live row when `version` matches
     /// the current version, otherwise the archived snapshot. `None` when the
     /// slug is unknown or that version was never recorded (or has been pruned).

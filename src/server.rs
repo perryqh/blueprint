@@ -223,6 +223,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/blueprints/:slug/raw", get(get_blueprint_raw))
         .route(
+            "/api/blueprints/:slug/versions",
+            get(list_blueprint_versions),
+        )
+        .route(
             "/api/blueprints/:slug/comments",
             get(list_comments).post(create_comment),
         )
@@ -446,6 +450,27 @@ async fn get_blueprint_raw(
         Ok(None) => (StatusCode::NOT_FOUND, "blueprint not found").into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct VersionsResponse {
+    current: u64,
+    /// Every version number that exists (archived + current), ascending.
+    versions: Vec<u64>,
+}
+
+/// `GET /api/blueprints/:slug/versions` — the version list backing the
+/// reviewer's version dropdown. 404 if the slug is unknown.
+async fn list_blueprint_versions(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<VersionsResponse>, AppError> {
+    let current = state
+        .store
+        .get_blueprint_version(&slug)?
+        .ok_or(AppError::NotFound)?;
+    let versions = state.store.list_versions(&slug)?;
+    Ok(Json(VersionsResponse { current, versions }))
 }
 
 async fn delete_blueprint(

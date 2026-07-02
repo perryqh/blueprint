@@ -225,7 +225,44 @@ blueprintFrame.addEventListener('load', () => {
   setupFrameListeners();
   refreshComments();
   startPolling();
+  loadVersions();
 });
+
+// Populate the header version dropdown. Runs on initial load and after each
+// update reload (the iframe 'load' fires both times). Historical versions open
+// as sandboxed snapshots in a new tab — consistent with the comment "on vN"
+// badge — rather than swapping the live review iframe.
+async function loadVersions() {
+  const menu = document.getElementById('version-menu');
+  const summary = document.getElementById('version-current');
+  const list = document.getElementById('version-list');
+  if (!menu || !summary || !list) return;
+  try {
+    const r = await fetch(`/api/blueprints/${slug}/versions`);
+    if (!r.ok) return;
+    const { current, versions } = await r.json();
+    summary.textContent = `v${current}`;
+    // A dropdown only earns its place once there's history to browse.
+    if (!Array.isArray(versions) || versions.length <= 1) {
+      menu.hidden = true;
+      return;
+    }
+    menu.hidden = false;
+    list.textContent = '';
+    for (const v of [...versions].sort((a, b) => b - a)) {
+      const a = document.createElement('a');
+      a.className = 'version-item' + (v === current ? ' is-current' : '');
+      a.href = `/api/blueprints/${slug}/raw?version=${v}`;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = v === current ? `v${v} · current` : `v${v}`;
+      a.addEventListener('click', () => { menu.open = false; });
+      list.appendChild(a);
+    }
+  } catch {
+    /* dropdown is a convenience; a fetch failure just leaves it hidden */
+  }
+}
 
 refreshMe();
 bindThemeToggle();
