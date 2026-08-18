@@ -99,10 +99,10 @@ The skill will:
 
 1. Write a self-contained HTML blueprint (executive summary, mockups, file-by-file plan, verification steps) to `~/.blueprint/drafts/<slug>.html`.
 2. Run `blueprint publish --no-open --json` and print the `127.0.0.1:7321/b/<slug>` URL back at you to open when you're ready.
-3. Start `blueprint watch <slug> --stream` in the background and use the `Monitor` tool to wake on each Submit-all batch.
+3. Start `blueprint watch <slug> --stream` in the background and use the `Monitor` tool to wake on each Submit-all batch, plus a plain `blueprint watch <slug>` to catch the **Finish Review** click.
 4. On each batch: triage by role (owner edits → HTML edit + reply; user / guest comments → reply only — see Step 3's role table), then `blueprint publish --slug <slug> --update` once per batch and post threaded replies. The browser shows a "Plan updated" banner; click Refresh to reload the iframe in place.
 
-Stage drafts in the sidebar and hit **Submit all** — that's one round trip, one wake-up. When you're done, click **Finish Review** in the browser or tell Claude in chat to wrap up; `blueprint watch` exits and the loop ends.
+Stage drafts in the sidebar and hit **Submit all** — that's one round trip, one wake-up. When you're done, click **Finish Review** in the browser or tell Claude in chat to wrap up; `blueprint watch` exits and the loop ends. The click is recorded server-side, so it isn't lost if Claude's waiter hasn't reconnected yet, and the button keeps showing when the review was finished across reloads.
 
 ### 7. Stop and clean up
 

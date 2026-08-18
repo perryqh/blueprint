@@ -82,6 +82,12 @@ pub struct Comment {
     pub author_avatar_url: Option<String>,
     pub role: AuthorRole,
     pub is_agent: bool,
+    /// Blueprint version this comment was authored against. `None` for legacy
+    /// comments written before version history existed. Read by the frontend
+    /// to badge comments made on a superseded version and to fetch the
+    /// historical snapshot for re-anchoring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blueprint_version: Option<i64>,
 }
 
 /// Input shape for `Store::add_comments_batch`. Mirrors `add_comment`'s
@@ -130,7 +136,22 @@ impl Store {
               slug         TEXT PRIMARY KEY,
               html         BLOB NOT NULL,
               created_at   INTEGER NOT NULL,
-              delete_token TEXT NOT NULL
+              delete_token TEXT NOT NULL,
+              version      INTEGER NOT NULL DEFAULT 1
+            );
+
+            -- Archive of prior HTML, keyed by (slug, version). On every
+            -- `update_blueprint_html` the *current* html is snapshotted here at
+            -- its current version before the live row is bumped and replaced,
+            -- so a comment authored against an older version can still be
+            -- resolved against the exact text it anchored to. Cascades away
+            -- with the blueprint.
+            CREATE TABLE IF NOT EXISTS blueprint_versions (
+              slug        TEXT NOT NULL REFERENCES blueprints(slug) ON DELETE CASCADE,
+              version     INTEGER NOT NULL,
+              html        BLOB NOT NULL,
+              created_at  INTEGER NOT NULL,
+              PRIMARY KEY (slug, version)
             );
 
             CREATE TABLE IF NOT EXISTS comments (
@@ -187,6 +208,39 @@ impl Store {
                 "comments",
                 "is_agent",
                 "ALTER TABLE comments ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0",
+            ),
+            // Version the blueprint was published at when this comment was
+            // written. NULL for comments predating version history — treated
+            // as "current" by the anchoring resolver.
+            (
+                "comments",
+                "blueprint_version",
+                "ALTER TABLE comments ADD COLUMN blueprint_version INTEGER",
+            ),
+            // Persist the live version on the blueprint row itself. Existing
+            // rows default to 1 so a pre-migration blueprint reads as v1.
+            (
+                "blueprints",
+                "version",
+                "ALTER TABLE blueprints ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+            ),
+            // Wall-clock ms of the most recent "Finish Review" click, or NULL if
+            // the blueprint has never been finished. Never cleared — it's what
+            // the reviewer header shows so the finished state survives a reload.
+            (
+                "blueprints",
+                "finished_at",
+                "ALTER TABLE blueprints ADD COLUMN finished_at INTEGER",
+            ),
+            // Latch: 1 when a finish click is waiting to be picked up by a
+            // `watch`, 0 once one has consumed it. Persisting the *pending* bit
+            // (rather than just comparing timestamps) is what makes the click
+            // durable — a reviewer can click with no watcher running at all and
+            // the next `watch` to connect still sees it.
+            (
+                "blueprints",
+                "finish_pending",
+                "ALTER TABLE blueprints ADD COLUMN finish_pending INTEGER NOT NULL DEFAULT 0",
             ),
         ] {
             let exists: bool = conn
@@ -314,16 +368,174 @@ impl Store {
         Ok(n)
     }
 
-    pub fn update_blueprint_html(&self, slug: &str, html: &[u8]) -> Result<(), AppError> {
+    /// Replace a blueprint's HTML, archiving the prior version first, and
+    /// return the new (bumped) version. The snapshot-then-bump-then-replace
+    /// runs in one transaction so a crash can't strand a half-archived state:
+    /// either the old version is preserved and the new one is live, or nothing
+    /// changed. Comments authored against the archived version keep resolving
+    /// against the exact text they anchored to via `get_blueprint_html_at`.
+    pub fn update_blueprint_html(&self, slug: &str, html: &[u8]) -> Result<u64, AppError> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "UPDATE blueprints SET html = ?1 WHERE slug = ?2",
+        let tx = conn.unchecked_transaction()?;
+        // Snapshot the CURRENT html at its CURRENT version into the archive.
+        // No-op INSERT if the slug doesn't exist (the UPDATE below reports it).
+        tx.execute(
+            "INSERT OR IGNORE INTO blueprint_versions (slug, version, html, created_at)
+             SELECT slug, version, html, ?2 FROM blueprints WHERE slug = ?1",
+            params![slug, now_ms()],
+        )?;
+        // Bump + replace the live row.
+        let rows = tx.execute(
+            "UPDATE blueprints SET html = ?1, version = version + 1 WHERE slug = ?2",
             params![html, slug],
         )?;
         if rows == 0 {
             return Err(AppError::NotFound);
         }
-        Ok(())
+        let new_version: i64 = tx.query_row(
+            "SELECT version FROM blueprints WHERE slug = ?1",
+            params![slug],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(new_version as u64)
+    }
+
+    /// Current live version of a blueprint, or `None` if the slug is unknown.
+    pub fn get_blueprint_version(&self, slug: &str) -> Result<Option<u64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row(
+                "SELECT version FROM blueprints WHERE slug = ?1",
+                params![slug],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(v.map(|n| n as u64))
+    }
+
+    /// Stamp "the reviewer clicked Finish Review" and raise the pending latch.
+    /// Returns the timestamp written. `Err(NotFound)` for an unknown slug.
+    /// Re-finishing is allowed and simply re-raises the latch, so a reviewer who
+    /// keeps going after finishing can end a later round too.
+    pub fn mark_finished(&self, slug: &str) -> Result<i64, AppError> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE blueprints SET finished_at = ?1, finish_pending = 1 WHERE slug = ?2",
+            params![now, slug],
+        )?;
+        if rows == 0 {
+            return Err(AppError::NotFound);
+        }
+        Ok(now)
+    }
+
+    /// Claim a pending finish, if there is one: returns `Some(finished_at)` and
+    /// lowers the latch, or `None` if no finish is waiting. `Err(NotFound)` for
+    /// an unknown slug.
+    ///
+    /// The clear is a single conditional UPDATE, so it's atomic — with several
+    /// waiters parked on one slug exactly one of them claims the finish, and a
+    /// later review round sees a lowered latch and parks correctly.
+    pub fn claim_finish(&self, slug: &str) -> Result<Option<i64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let claimed = conn.execute(
+            "UPDATE blueprints SET finish_pending = 0 WHERE slug = ?1 AND finish_pending = 1",
+            params![slug],
+        )? == 1;
+        if !claimed {
+            // Distinguish "nothing pending" from "no such blueprint".
+            let exists = read_version(&conn, slug)?.is_some();
+            return if exists { Ok(None) } else { Err(AppError::NotFound) };
+        }
+        let stamp: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT finished_at FROM blueprints WHERE slug = ?1",
+                params![slug],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        match stamp {
+            // The row vanished between the claim and this read — the blueprint
+            // was deleted concurrently. Nothing left to finish.
+            None => Err(AppError::NotFound),
+            // We lowered the latch, so a finish *was* claimed and must be
+            // reported. `mark_finished` always writes both columns together, so
+            // a NULL stamp means a corrupted row; substituting `now` keeps the
+            // wakeup rather than dropping it and parking the waiter forever.
+            Some(ts) => Ok(Some(ts.unwrap_or_else(now_ms))),
+        }
+    }
+
+    /// When this blueprint was last finished, regardless of whether a waiter has
+    /// claimed it. `Ok(None)` means never finished; `Err(NotFound)` means the
+    /// slug doesn't exist. Drives the reviewer header's durable finished state.
+    pub fn finished_at(&self, slug: &str) -> Result<Option<i64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT finished_at FROM blueprints WHERE slug = ?1",
+            params![slug],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .ok_or(AppError::NotFound)
+    }
+
+    /// All version numbers for a blueprint (archived + the live one),
+    /// ascending. `Err(NotFound)` for an unknown slug. Backs the reviewer's
+    /// version dropdown.
+    pub fn list_versions(&self, slug: &str) -> Result<(u64, Vec<u64>), AppError> {
+        let conn = self.conn.lock().unwrap();
+        // One query: the archive holds every superseded version and the live
+        // row holds the current one. UNION dedups; ORDER BY sorts. The live
+        // version is always the max, so `current` falls out of the last row —
+        // no separate lookup. Empty result ⇒ unknown slug.
+        let mut stmt = conn.prepare(
+            "SELECT version FROM blueprint_versions WHERE slug = ?1
+             UNION SELECT version FROM blueprints WHERE slug = ?1
+             ORDER BY version ASC",
+        )?;
+        let versions: Vec<u64> = stmt
+            .query_map(params![slug], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?
+            .into_iter()
+            .map(|v| v as u64)
+            .collect();
+        let current = *versions.last().ok_or(AppError::NotFound)?;
+        Ok((current, versions))
+    }
+
+    /// HTML for a specific version. Serves the live row when `version` matches
+    /// the current version, otherwise the archived snapshot. `None` when the
+    /// slug is unknown or that version was never recorded (or has been pruned).
+    pub fn get_blueprint_html_at(
+        &self,
+        slug: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        // Live row first — the current version is not copied into the archive.
+        let live: Option<(i64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT version, html FROM blueprints WHERE slug = ?1",
+                params![slug],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((cur, html)) = live
+            && cur as u64 == version
+        {
+            return Ok(Some(html));
+        }
+        let archived = conn
+            .query_row(
+                "SELECT html FROM blueprint_versions WHERE slug = ?1 AND version = ?2",
+                params![slug, version as i64],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        Ok(archived)
     }
 
     pub fn get_blueprint(&self, slug: &str) -> Result<Option<Blueprint>, AppError> {
@@ -432,10 +644,13 @@ impl Store {
         let now = now_ms();
         let sel_json = serde_json::to_string(selector)?;
         let conn = self.conn.lock().unwrap();
+        // Stamp the version the comment is being written against, read under
+        // the same lock so it can't race an interleaved update.
+        let blueprint_version = read_version(&conn, slug)?;
         conn.execute(
-            "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
-            params![id, slug, author, body, sel_json, parent_id, now, author_user_id, role.as_str(), is_agent as i64],
+            "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent, blueprint_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
+            params![id, slug, author, body, sel_json, parent_id, now, author_user_id, role.as_str(), is_agent as i64, blueprint_version],
         )?;
         // If this comment is a reply, clear processing state on its parent — the agent
         // that was working on it has now produced its response.
@@ -461,6 +676,7 @@ impl Store {
             author_avatar_url,
             role,
             is_agent,
+            blueprint_version,
         })
     }
 
@@ -510,14 +726,18 @@ impl Store {
             }
         }
 
+        // All comments in a Submit-all batch are stamped with the same version
+        // — the one live when the batch landed. Read once under the tx.
+        let blueprint_version = read_version(&tx, slug)?;
+
         let mut out = Vec::with_capacity(drafts.len());
         let mut parents_to_clear: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for d in drafts {
             let sel_json = serde_json::to_string(&d.selector)?;
             tx.execute(
-                "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
+                "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent, blueprint_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     d.id,
                     slug,
@@ -529,6 +749,7 @@ impl Store {
                     d.author_user_id,
                     d.role.as_str(),
                     d.is_agent as i64,
+                    blueprint_version,
                 ],
             )?;
             if let Some(pid) = &d.parent_id {
@@ -549,6 +770,7 @@ impl Store {
                 author_avatar_url: d.author_avatar_url.clone(),
                 role: d.role,
                 is_agent: d.is_agent,
+                blueprint_version,
             });
         }
         // Mirror add_comment's behavior: any parent that just got a reply
@@ -569,7 +791,7 @@ impl Store {
         let row = conn
             .query_row(
                 "SELECT c.id, c.slug, c.author, c.body, c.selector, c.parent_id, c.resolved, c.created_at,
-                        c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url, c.role, c.is_agent
+                        c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url, c.role, c.is_agent, c.blueprint_version
                  FROM comments c LEFT JOIN users u ON c.author_user_id = u.id
                  WHERE c.slug = ?1 AND c.id = ?2",
                 params![slug, id],
@@ -583,7 +805,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.slug, c.author, c.body, c.selector, c.parent_id, c.resolved, c.created_at,
-                    c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url, c.role, c.is_agent
+                    c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url, c.role, c.is_agent, c.blueprint_version
              FROM comments c LEFT JOIN users u ON c.author_user_id = u.id
              WHERE c.slug = ?1 AND c.created_at > ?2 ORDER BY c.created_at ASC",
         )?;
@@ -630,6 +852,20 @@ impl Store {
     }
 }
 
+/// Read a blueprint's current version under an existing connection or
+/// transaction, for stamping onto a comment at write time. `None` for an
+/// unknown slug. Shared by `add_comment` and `add_comments_batch` so the
+/// stamp semantics live in one place.
+fn read_version(conn: &Connection, slug: &str) -> Result<Option<i64>, AppError> {
+    Ok(conn
+        .query_row(
+            "SELECT version FROM blueprints WHERE slug = ?1",
+            params![slug],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
     let sel_json: String = r.get(4)?;
     let selector: TextQuoteSelector = serde_json::from_str(&sel_json).map_err(|e| {
@@ -653,6 +889,7 @@ fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
         author_avatar_url: r.get(11)?,
         role: AuthorRole::from_str(&role_str),
         is_agent: is_agent_int != 0,
+        blueprint_version: r.get(14)?,
     })
 }
 

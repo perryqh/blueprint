@@ -188,7 +188,9 @@ async fn publish_comment_reply_finish_fetch_drift_unpublish() {
         .unwrap();
     assert_eq!(later["comments"].as_array().unwrap().len(), 0);
 
-    // 10. `wait` unblocks on `finish`.
+    // 10. A waiter already parked when the click lands is woken by the broadcast.
+    //     No sleep needed to "let the waiter register" — if it hasn't subscribed
+    //     yet it just claims the persisted latch instead.
     let wait_base = s.base.clone();
     let waiter = tokio::spawn(async move {
         let r = reqwest::Client::new()
@@ -199,19 +201,73 @@ async fn publish_comment_reply_finish_fetch_drift_unpublish() {
             .unwrap();
         r.status()
     });
-    // Give the waiter a moment to register.
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let r = http
         .post(format!("{}/api/blueprints/test-plan/finish", s.base))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 204);
+    assert_eq!(r.status(), 200);
+    let finished_at = r.json::<Value>().await.unwrap()["finished_at"]
+        .as_i64()
+        .expect("finish returns its timestamp");
     let waiter_status = tokio::time::timeout(Duration::from_secs(2), waiter)
         .await
         .expect("wait unblocked in time")
         .unwrap();
-    assert_eq!(waiter_status, 204);
+    assert_eq!(waiter_status, 200);
+
+    // 10b. That waiter consumed the latch, so a second `wait` must park rather
+    //      than resolve — otherwise every later round would end instantly.
+    //      Timing out here is the pass condition.
+    let already_claimed = http
+        .get(format!("{}/api/blueprints/test-plan/wait", s.base))
+        .timeout(Duration::from_millis(300))
+        .send()
+        .await;
+    assert!(
+        already_claimed.is_err(),
+        "an already-claimed finish must not resolve a later wait"
+    );
+
+    // 10c. The durability guarantee, and the case that used to silently hang:
+    //      click with NO waiter running, then connect afterwards. The latch is
+    //      persisted, so the late waiter claims it immediately.
+    let r = http
+        .post(format!("{}/api/blueprints/test-plan/finish", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let refinished_at = r.json::<Value>().await.unwrap()["finished_at"]
+        .as_i64()
+        .unwrap();
+    let r = http
+        .get(format!("{}/api/blueprints/test-plan/wait", s.base))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .expect("a finish clicked before the waiter connected is still claimed");
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["finished_at"]
+            .as_i64()
+            .unwrap(),
+        refinished_at
+    );
+
+    // 10d. The finish stamp is visible on the comments response even though the
+    //      latch has been consumed, so the browser shows the finished state
+    //      durably across a reload.
+    let listing: Value = http
+        .get(format!("{}/api/blueprints/test-plan/comments", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listing["finished_at"].as_i64().unwrap(), refinished_at);
+    assert!(refinished_at >= finished_at);
 
     // 11. Anchor survives revision: keep "world", change surrounding text.
     let html_v2 = r#"<p>Hello <em>world</em>, this is the SECOND <strong>iteration</strong>.</p>"#;
@@ -779,6 +835,7 @@ fn test_comment(
         author_avatar_url: None,
         role: blueprint::store::AuthorRole::Guest,
         is_agent: false,
+        blueprint_version: None,
     }
 }
 

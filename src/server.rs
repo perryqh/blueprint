@@ -4,7 +4,7 @@ use crate::slug;
 use crate::store::{BlueprintSummary, Comment, CommentDraft, Store};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -14,7 +14,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
+
+/// Maximum request body accepted on any route. A blueprint is HTML, not a
+/// binary payload; without a cap an unauthenticated localhost POST can buffer
+/// an arbitrarily large body into memory before any handler runs. 8 MiB is
+/// generous for a self-contained plan page.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Ceiling on concurrently-held long-poll connections (`/wait`,
+/// `/wait-comment`). Each pins a socket for up to ~30s (comments) or hours
+/// (finish); unbounded, a flood exhausts the runtime. Sized for a real
+/// single-user workspace — a few viewer tabs plus active agent long-polls —
+/// so a genuine flood is refused while normal use never hits the wall.
+const MAX_HELD_CONNECTIONS: usize = 32;
 
 /// 5-minute TTL on a slug-level batch-processing entry. If the skill crashes
 /// between `start` and the last reply (and so never DELETE'd), the entry is
@@ -31,7 +44,6 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<Event>,
     pub finish_signals: Arc<Mutex<HashMap<String, broadcast::Sender<()>>>>,
-    pub blueprint_versions: Arc<Mutex<HashMap<String, u64>>>,
     /// Per-slug "the agent is working on this batch" state, in-memory only.
     /// Set by `POST /api/blueprints/:slug/batch-processing` when the skill
     /// wakes on a Submit-all batch, cleared either explicitly via DELETE or
@@ -44,6 +56,10 @@ pub struct AppState {
     /// `daemon::run_foreground` selects on this alongside ctrl-c/SIGTERM so
     /// the HTTP-triggered shutdown reuses axum's graceful-shutdown path.
     pub shutdown: Arc<Notify>,
+    /// Bounds concurrently-held long-poll connections. A handler acquires a
+    /// permit for the duration it blocks; over `MAX_HELD_CONNECTIONS` the
+    /// permit is refused and the request 503s instead of pinning a slot.
+    pub held: Arc<Semaphore>,
 }
 
 /// Slug-level "Claude is working on N comments" state. Lives only in memory
@@ -101,10 +117,10 @@ impl AppState {
             store,
             events: tx,
             finish_signals: Arc::new(Mutex::new(HashMap::new())),
-            blueprint_versions: Arc::new(Mutex::new(HashMap::new())),
             batch_processing: Arc::new(Mutex::new(HashMap::new())),
             auth,
             shutdown: Arc::new(Notify::new()),
+            held: Arc::new(Semaphore::new(MAX_HELD_CONNECTIONS)),
         }
     }
 
@@ -170,15 +186,16 @@ impl AppState {
             .clone()
     }
 
-    pub async fn bump_version(&self, slug: &str) -> u64 {
-        let mut m = self.blueprint_versions.lock().await;
-        let v = m.entry(slug.to_string()).or_insert(0);
-        *v += 1;
-        *v
-    }
-
-    pub async fn blueprint_version(&self, slug: &str) -> u64 {
-        *self.blueprint_versions.lock().await.get(slug).unwrap_or(&0)
+    /// Current persisted version of a blueprint (DB-authoritative). Returns 0
+    /// for an unknown slug so callers can treat "missing" as version 0. The
+    /// frontend polls this off the comments response to show the "Blueprint
+    /// updated" banner when it increments.
+    pub fn blueprint_version(&self, slug: &str) -> u64 {
+        self.store
+            .get_blueprint_version(slug)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 }
 
@@ -205,6 +222,10 @@ pub fn router(state: AppState) -> Router {
             delete(delete_blueprint).put(update_blueprint),
         )
         .route("/api/blueprints/:slug/raw", get(get_blueprint_raw))
+        .route(
+            "/api/blueprints/:slug/versions",
+            get(list_blueprint_versions),
+        )
         .route(
             "/api/blueprints/:slug/comments",
             get(list_comments).post(create_comment),
@@ -239,6 +260,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(crate::auth::me))
         .layer(session_layer)
         .route("/static/*path", get(static_asset))
+        // Applies to every route above: refuse a body over the cap with 413
+        // before any handler buffers it. GET routes carry no body, so this is
+        // a no-op for them and a hard ceiling for the write endpoints.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -318,7 +343,7 @@ async fn create_blueprint(
         state
             .store
             .insert_blueprint(&slug, input.html.as_bytes(), &token, client_cwd)?;
-    state.bump_version(&blueprint.slug).await;
+    // A freshly inserted blueprint is version 1 (column default); no bump.
     Ok(Json(CreateBlueprintOutput {
         slug: blueprint.slug.clone(),
         url: format!("/b/{}", blueprint.slug),
@@ -359,10 +384,10 @@ async fn update_blueprint(
     Path(slug): Path<String>,
     Json(input): Json<UpdateBlueprintInput>,
 ) -> Result<StatusCode, AppError> {
+    // Archives the prior version and bumps to the new one atomically.
     state
         .store
         .update_blueprint_html(&slug, input.html.as_bytes())?;
-    state.bump_version(&slug).await;
     let _ = state.events.send(Event {
         slug: slug.clone(),
         kind: EventKind::BlueprintUpdated,
@@ -370,8 +395,38 @@ async fn update_blueprint(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_blueprint_raw(State(state): State<AppState>, Path(slug): Path<String>) -> Response {
-    match state.store.get_blueprint_html(&slug) {
+#[derive(Deserialize)]
+struct RawQuery {
+    /// Fetch a specific historical version. Omitted → the current live HTML.
+    /// Used by the frontend to re-anchor a comment authored against a
+    /// superseded version against the exact text it commented on.
+    #[serde(default)]
+    version: Option<u64>,
+}
+
+async fn get_blueprint_raw(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Query(q): Query<RawQuery>,
+    headers: HeaderMap,
+) -> Response {
+    // The reviewer embeds this document in a same-origin iframe and reaches
+    // into its `contentDocument` to place highlights and inject theme styles —
+    // so it MUST stay same-origin for the embed. A `sandbox` CSP would force an
+    // opaque origin and silently break anchoring. We only want to sandbox the
+    // *escalation* case: someone opening `/raw` as a top-level page (a shared
+    // link, "open frame in new tab", the version-badge snapshot link), where
+    // agent-authored script would otherwise run in the daemon origin. Browsers
+    // tag that load `Sec-Fetch-Dest: document`; the iframe embed is tagged
+    // `iframe`. Gate on that so the embed keeps same-origin access while a
+    // direct open is sandboxed.
+    let top_level_nav =
+        headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) == Some("document");
+    let fetched = match q.version {
+        Some(v) => state.store.get_blueprint_html_at(&slug, v),
+        None => state.store.get_blueprint_html(&slug),
+    };
+    match fetched {
         Ok(Some(bytes)) => {
             let mut resp = Response::new(bytes.into());
             resp.headers_mut().insert(
@@ -380,11 +435,38 @@ async fn get_blueprint_raw(State(state): State<AppState>, Path(slug): Path<Strin
             );
             resp.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            // Sandbox a direct top-level open into an opaque origin (allow-scripts
+            // so Prism/Mermaid still run, never allow-same-origin) so agent HTML
+            // can't reach the daemon origin's storage or window.open the reviewer.
+            // Skipped for the iframe embed, which needs same-origin access.
+            if top_level_nav {
+                resp.headers_mut().insert(
+                    header::CONTENT_SECURITY_POLICY,
+                    HeaderValue::from_static("sandbox allow-scripts"),
+                );
+            }
             resp
         }
         Ok(None) => (StatusCode::NOT_FOUND, "blueprint not found").into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct VersionsResponse {
+    current: u64,
+    /// Every version number that exists (archived + current), ascending.
+    versions: Vec<u64>,
+}
+
+/// `GET /api/blueprints/:slug/versions` — the version list backing the
+/// reviewer's version dropdown. 404 if the slug is unknown.
+async fn list_blueprint_versions(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<VersionsResponse>, AppError> {
+    let (current, versions) = state.store.list_versions(&slug)?;
+    Ok(Json(VersionsResponse { current, versions }))
 }
 
 async fn delete_blueprint(
@@ -432,13 +514,17 @@ async fn build_comments_response(
     comments: Vec<Comment>,
 ) -> CommentsResponse {
     let server_ts = crate::store::now_ms();
-    let blueprint_version = state.blueprint_version(slug).await;
+    let blueprint_version = state.blueprint_version(slug);
     let batch_processing = state.current_batch_processing(slug).await;
+    // A missing/unknown slug reads as "not finished" — this response is built on
+    // paths that have already established the blueprint exists.
+    let finished_at = state.store.finished_at(slug).ok().flatten();
     CommentsResponse {
         comments,
         server_ts,
         blueprint_version,
         batch_processing,
+        finished_at,
     }
 }
 
@@ -453,6 +539,11 @@ struct CommentsResponse {
     /// so older clients that don't know about it see the same shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_processing: Option<BatchProcessing>,
+    /// When this blueprint was last marked finished, or `None` if never. Lets
+    /// the reviewer header show a durable "finished" state that survives a
+    /// reload, instead of a toast that vanishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -664,17 +755,25 @@ async fn create_reply(
     Ok(Json(comment))
 }
 
+#[derive(Serialize)]
+struct FinishResponse {
+    finished_at: i64,
+}
+
+/// `POST /api/blueprints/:slug/finish` — the reviewer is done with this round.
+/// Persists the timestamp *first*, then wakes any parked `/wait`. The write is
+/// what makes this durable: the broadcast is only a wakeup nudge, and
+/// `broadcast::send` fails silently when nobody is subscribed, so a click with
+/// no `watch` running would otherwise vanish.
 async fn finish_review(
     State(state): State<AppState>,
     _w: crate::auth::WriteIdentity,
     Path(slug): Path<String>,
-) -> Result<StatusCode, AppError> {
-    if state.store.get_blueprint(&slug)?.is_none() {
-        return Err(AppError::NotFound);
-    }
+) -> Result<Json<FinishResponse>, AppError> {
+    let finished_at = state.store.mark_finished(&slug)?;
     let sender = state.finish_sender(&slug).await;
     let _ = sender.send(());
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(FinishResponse { finished_at }))
 }
 
 #[derive(Deserialize)]
@@ -718,17 +817,47 @@ async fn set_resolved(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Long-poll endpoint that blocks until the reviewer clicks Finish Review.
+///
+/// Consumes a *persisted latch* rather than waiting on a live signal, which is
+/// what makes the button durable: the reviewer can click with no `watch` running
+/// at all, and the next one to connect claims it immediately. Claiming lowers
+/// the latch, so a subsequent review round parks properly instead of being ended
+/// instantly by the previous round's click.
+///
+/// Subscribes BEFORE the first claim attempt so a finish arriving between the
+/// claim and the park is caught by the subscription rather than dropped.
 async fn wait_for_finish(
     State(state): State<AppState>,
     Path(slug): Path<String>,
-) -> Result<StatusCode, AppError> {
-    if state.store.get_blueprint(&slug)?.is_none() {
-        return Err(AppError::NotFound);
-    }
+) -> Result<Json<FinishResponse>, AppError> {
     let sender = state.finish_sender(&slug).await;
     let mut rx = sender.subscribe();
-    let _ = rx.recv().await;
-    Ok(StatusCode::NO_CONTENT)
+
+    // Fast path: a click is already waiting. Doubles as the existence check —
+    // `claim_finish` is `Err(NotFound)` for an unknown slug.
+    if let Some(finished_at) = state.store.claim_finish(&slug)? {
+        return Ok(Json(FinishResponse { finished_at }));
+    }
+
+    // Slow path: park until a finish is broadcast. Bound the connections held
+    // here — acquired only on the slow path so fast-path claims never trip it.
+    let _permit = state
+        .held
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyConnections)?;
+    loop {
+        if rx.recv().await.is_err() {
+            // Sender dropped (daemon shutting down) — nothing more will arrive.
+            return Err(AppError::NotFound);
+        }
+        // The broadcast is only a nudge; the latch is authoritative. If another
+        // waiter claimed this finish first, keep parking.
+        if let Some(finished_at) = state.store.claim_finish(&slug)? {
+            return Ok(Json(FinishResponse { finished_at }));
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -823,7 +952,15 @@ async fn wait_for_comment(
         return Ok(Json(build_comments_response(&state, &slug, existing).await));
     }
 
-    // Slow path: wait for the next CommentAdded event for this slug.
+    // Slow path: wait for the next CommentAdded event for this slug. Bound the
+    // connections parked here — over the ceiling, refuse rather than pin
+    // another slot. Acquired only on the slow path so a burst of fast-path
+    // reads (comments already present) never trips the limit.
+    let _permit = state
+        .held
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyConnections)?;
     let timeout = tokio::time::sleep(Duration::from_secs(30));
     tokio::pin!(timeout);
 

@@ -225,7 +225,44 @@ blueprintFrame.addEventListener('load', () => {
   setupFrameListeners();
   refreshComments();
   startPolling();
+  loadVersions();
 });
+
+// Populate the header version dropdown. Runs on initial load and after each
+// update reload (the iframe 'load' fires both times). Historical versions open
+// as sandboxed snapshots in a new tab — consistent with the comment "on vN"
+// badge — rather than swapping the live review iframe.
+async function loadVersions() {
+  const menu = document.getElementById('version-menu');
+  const summary = document.getElementById('version-current');
+  const list = document.getElementById('version-list');
+  if (!menu || !summary || !list) return;
+  try {
+    const r = await fetch(`/api/blueprints/${slug}/versions`);
+    if (!r.ok) return;
+    const { current, versions } = await r.json();
+    summary.textContent = `v${current}`;
+    // A dropdown only earns its place once there's history to browse.
+    if (!Array.isArray(versions) || versions.length <= 1) {
+      menu.hidden = true;
+      return;
+    }
+    menu.hidden = false;
+    list.textContent = '';
+    for (const v of [...versions].sort((a, b) => b - a)) {
+      const a = document.createElement('a');
+      a.className = 'version-item' + (v === current ? ' is-current' : '');
+      a.href = `/api/blueprints/${slug}/raw?version=${v}`;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = v === current ? `v${v} · current` : `v${v}`;
+      a.addEventListener('click', () => { menu.open = false; });
+      list.appendChild(a);
+    }
+  } catch {
+    /* dropdown is a convenience; a fetch failure just leaves it hidden */
+  }
+}
 
 refreshMe();
 bindThemeToggle();
@@ -273,6 +310,13 @@ function injectFrameStyles(doc) {
   const style = doc.createElement('style');
   style.id = 'ps-injected-styles';
   style.textContent = `
+    span[data-ps-hl], span[data-ps-hl] * {
+      /* The highlight background is always a light yellow, so force dark text
+         (and any nested colored text) to stay legible on it — plan HTML with
+         white/light type would otherwise wash out. */
+      color: #1c1917 !important;
+      -webkit-text-fill-color: #1c1917 !important;
+    }
     span[data-ps-hl] {
       background-color: ${bg} !important;
       box-shadow: 0 0 0 1px ${bd} !important;
@@ -538,20 +582,50 @@ document.getElementById('finish-btn').addEventListener('click', async (e) => {
   setLoading(btn, true);
   try {
     const r = await fetch(`/api/blueprints/${slug}/finish`, { method: 'POST' });
-    if (r.ok) showToast('Marked review complete', 'success');
-    else showToast(`Finish failed: ${r.status}`, 'error');
+    if (r.ok) {
+      const { finished_at } = await r.json();
+      renderFinishedState(finished_at);
+      showToast('Review finished — Claude has been told to wrap up', 'success');
+    } else {
+      showToast(`Finish failed: ${r.status}`, 'error');
+    }
   } finally {
     setLoading(btn, false);
   }
 });
 
+// Reflect the server's persisted finish stamp on the button. Called on every
+// poll, so the state survives a reload and shows up in a second tab. The button
+// stays clickable on purpose: if the reviewer keeps going after finishing,
+// they need to be able to end the next round too.
+function renderFinishedState(finishedAt) {
+  if (finishedAt === lastFinishedAt) return;
+  lastFinishedAt = finishedAt;
+  const btn = document.getElementById('finish-btn');
+  if (!btn) return;
+  if (!finishedAt) {
+    btn.classList.remove('is-finished');
+    btn.textContent = 'Finish Review';
+    btn.title = '';
+    return;
+  }
+  const when = new Date(finishedAt).toLocaleTimeString([], {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+  btn.classList.add('is-finished');
+  btn.textContent = `Finished ${when}`;
+  btn.title = 'Review marked finished. Click again to end another round.';
+}
+
 async function refreshComments() {
   const r = await fetch(`/api/blueprints/${slug}/comments`);
   if (!r.ok) return;
-  const { comments, server_ts, blueprint_version, batch_processing } = await r.json();
+  const { comments, server_ts, blueprint_version, batch_processing, finished_at } = await r.json();
   lastTs = server_ts;
   allComments = comments;
   renderBatchIndicator(batch_processing ?? null);
+  renderFinishedState(finished_at ?? null);
   if (lastBlueprintVersion === null) lastBlueprintVersion = blueprint_version;
   // Seed auto-scroll bookkeeping so the first poll doesn't mistake existing
   // comments for new arrivals.
@@ -568,9 +642,10 @@ async function pollOnce() {
     // comments — processing flags going on/off, resolve toggles — actually propagate.
     const r = await fetch(`/api/blueprints/${slug}/comments`);
     if (!r.ok) return;
-    const { comments, server_ts, blueprint_version, batch_processing } = await r.json();
+    const { comments, server_ts, blueprint_version, batch_processing, finished_at } = await r.json();
     lastTs = server_ts;
     renderBatchIndicator(batch_processing ?? null);
+    renderFinishedState(finished_at ?? null);
 
     // If the server has a newer plan version than what we've loaded, show a banner
     // instead of auto-reloading (preserves scroll position and reading state).
@@ -1021,6 +1096,8 @@ function makeSparkleSvg() {
 // so the 1.5s sidebar poll doesn't tear down + rebuild the indicator when
 // nothing actually changed.
 let lastBatchProcessingKey = null;
+// Last finish stamp rendered on the button, so repeat polls don't rebuild it.
+let lastFinishedAt = null;
 
 /* Slug-level "Claude is working on N comments" pill — server `batch_processing`
    field, set by `blueprint batch-processing start` and cleared on the last
@@ -1080,6 +1157,24 @@ function renderComment(c, replies, byParent) {
   ts.textContent = timeAgo(c.created_at);
   ts.title = new Date(c.created_at).toLocaleString();
   author.appendChild(ts);
+  // Version badge: this comment was authored against an older snapshot than
+  // the one currently rendered in the iframe. Link to that exact snapshot
+  // (served with a no-store sandbox) so the reviewer can see the text it
+  // anchored to — the plan may have since edited that passage away.
+  if (
+    c.blueprint_version != null &&
+    lastBlueprintVersion != null &&
+    c.blueprint_version < lastBlueprintVersion
+  ) {
+    const vb = document.createElement('a');
+    vb.className = 'version-badge';
+    vb.textContent = `on v${c.blueprint_version}`;
+    vb.href = `/api/blueprints/${slug}/raw?version=${c.blueprint_version}`;
+    vb.target = '_blank';
+    vb.rel = 'noopener';
+    vb.title = `Authored against version ${c.blueprint_version}; you're viewing v${lastBlueprintVersion}. Open that snapshot in a new tab.`;
+    author.appendChild(vb);
+  }
   wrap.appendChild(author);
   const body = document.createElement('div');
   body.className = 'body';

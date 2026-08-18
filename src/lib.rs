@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cli;
 pub mod daemon;
 pub mod error;
+pub mod mcp;
 pub mod review_file;
 pub mod selector;
 pub mod server;
