@@ -449,13 +449,23 @@ impl Store {
             let exists = read_version(&conn, slug)?.is_some();
             return if exists { Ok(None) } else { Err(AppError::NotFound) };
         }
-        conn.query_row(
-            "SELECT finished_at FROM blueprints WHERE slug = ?1",
-            params![slug],
-            |r| r.get::<_, Option<i64>>(0),
-        )
-        .optional()?
-        .ok_or(AppError::NotFound)
+        let stamp: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT finished_at FROM blueprints WHERE slug = ?1",
+                params![slug],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        match stamp {
+            // The row vanished between the claim and this read — the blueprint
+            // was deleted concurrently. Nothing left to finish.
+            None => Err(AppError::NotFound),
+            // We lowered the latch, so a finish *was* claimed and must be
+            // reported. `mark_finished` always writes both columns together, so
+            // a NULL stamp means a corrupted row; substituting `now` keeps the
+            // wakeup rather than dropping it and parking the waiter forever.
+            Some(ts) => Ok(Some(ts.unwrap_or_else(now_ms))),
+        }
     }
 
     /// When this blueprint was last finished, regardless of whether a waiter has
