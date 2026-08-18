@@ -468,6 +468,9 @@ async fn watch(slug: String, stream: bool) -> Result<()> {
         return watch_stream(slug).await;
     }
     let info = require_running()?;
+    // No "since" anchor: the daemon holds a pending-finish latch, so a click that
+    // happened before this process even started is still claimed here. Anchoring
+    // on start time would throw away exactly the case this is meant to survive.
     let url = format!("{}/api/blueprints/{}/wait", base_url(&info), slug);
     println!("Waiting for \"Finish Review\" on {}…", slug);
     let resp = cli_http_client()

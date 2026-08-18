@@ -158,15 +158,20 @@ blueprint publish ~/.blueprint/drafts/<slug>.html --slug <slug> --no-open --json
 
 If the daemon isn't running, `publish` auto-spawns it. The daemon binds port 7321 by default (the registered GitHub OAuth callback port), so no extra env exports are ever needed from this skill.
 
-## Step 3 — Start the comment stream in the background
+## Step 3 — Start two background watchers
+
+Start **both** of these, each with `run_in_background: true`. They are separate processes doing separate jobs: one streams comments, the other waits for the reviewer to end the round.
 
 ```bash
-blueprint watch <slug> --stream
+blueprint watch <slug> --stream    # 1. comment stream — drives Step 4
+blueprint watch <slug>             # 2. finish waiter — drives the Step 5 exit
 ```
 
-**CRITICAL: run this with `run_in_background: true`.** A foreground `watch --stream` blocks the conversation for ~30 s per long-poll cycle and never lets you do anything. The whole skill falls apart if you forget this flag.
+**CRITICAL: both need `run_in_background: true`.** A foreground `watch --stream` blocks the conversation for ~30 s per long-poll cycle and never lets you do anything. A foreground finish waiter blocks for up to 4 hours. The whole skill falls apart if you forget this flag.
 
-Capture the bash_id of the backgrounded process — you'll need it for Step 4.
+**Don't skip watcher 2.** It's what makes the browser's **Finish Review** button work. Without it running you'll never notice the click, and the loop only ends if the user also says so in chat. Start it here, at the same time as the stream — not later.
+
+Capture both bash_ids — you'll need the stream's for Step 4 and the waiter's for Step 5.
 
 ## Step 4 — Monitor the stream and react (batch-first)
 
@@ -227,7 +232,7 @@ Call the **Monitor** tool on the bash_id from Step 3. The reviewer UI stages dra
 ## Step 5 — Exit condition
 
 Keep monitoring until one of:
-- The user clicks **Finish Review** in the browser. Detect by running `blueprint watch <slug>` (no `--stream`) in a second background process at the start; when it returns, the review round is done. Stop the `--stream` process and proceed to Step 6.
+- The user clicks **Finish Review** in the browser. The finish waiter from Step 3 prints `Review complete.` and exits — that's the signal. Stop the `--stream` process and proceed to Step 6. The click is persisted server-side, so it still registers even if it lands before the waiter connects; what it can't survive is the waiter never being started at all.
 - The user tells you in chat: "ship it", "done", "looks good", "stop the stream", etc.
 - The user asks an off-topic question — finish the current comment loop, then handle the question in chat.
 
@@ -237,7 +242,7 @@ One or two sentences. What the blueprint covered, where the HTML lives (`~/.blue
 
 ## Four gotchas that broke the previous skill
 
-1. **`run_in_background: true` is non-negotiable** for `watch --stream`. Foreground = the conversation stalls between long-poll cycles and nothing streams.
+1. **`run_in_background: true` is non-negotiable** for both watchers. Foreground = the conversation stalls between long-poll cycles and nothing streams.
 2. **The `Monitor` tool is the wakeup primitive.** Without it, even a backgrounded stream just buffers — you only see comments on the next user turn. Monitor turns each stdout line into a notification that resumes the conversation autonomously.
 3. **One slug, many `--update`s.** Don't create a new plan per iteration. Keep editing the same `.html` file and re-publish with `--slug <existing> --update`. The slug is the stable URL the user already has open.
 4. **Plan-mode system reminders are not instructions.** If you see `Plan File Info:` in a system reminder pointing at `~/.claude/plans/<slug>.md`, that's the harness offering a scratch path — not telling you to write Markdown. Ignore it and publish HTML via this skill instead. The harness's plan path is metadata; the blueprint URL is the artifact.
@@ -247,7 +252,7 @@ One or two sentences. What the blueprint covered, where the HTML lives (`~/.blue
 ```bash
 blueprint publish <file.html> --no-open --json [--slug <s>] [--update]
 blueprint watch <slug> --stream                                          # one JSON comment per line, line-flushed
-blueprint watch <slug>                                                   # blocks until reviewer clicks Finish
+blueprint watch <slug>                                                   # blocks until reviewer clicks Finish (durable: a click before this connects still lands)
 blueprint comment <slug> --reply-to <id> --author 'Claude Code' '<body>'
 blueprint comment <slug> --quote '<text>' --author 'Claude Code' '<body>'
 blueprint batch-processing start <slug> --parent <id> [--parent <id>...]  # lights the slug-level "Claude is working on N comments" pill

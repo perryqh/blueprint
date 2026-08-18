@@ -407,6 +407,16 @@ body.reviewer {
     background: var(--color-success-bg);
   }
 }
+/* Persisted "already finished this round" state. Deliberately still looks
+   clickable — finishing again is valid — just visually settled rather than a
+   call to action. */
+#finish-btn.is-finished {
+  background: var(--color-success-bg);
+  color: var(--color-success-fg);
+  border: 1px solid var(--color-success-border);
+  font-weight: var(--weight-medium);
+}
+#finish-btn.is-finished:hover { background: var(--color-success-bg); }
 
 /* Theme toggle */
 .theme-toggle {

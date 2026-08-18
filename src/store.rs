@@ -224,6 +224,24 @@ impl Store {
                 "version",
                 "ALTER TABLE blueprints ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
             ),
+            // Wall-clock ms of the most recent "Finish Review" click, or NULL if
+            // the blueprint has never been finished. Never cleared — it's what
+            // the reviewer header shows so the finished state survives a reload.
+            (
+                "blueprints",
+                "finished_at",
+                "ALTER TABLE blueprints ADD COLUMN finished_at INTEGER",
+            ),
+            // Latch: 1 when a finish click is waiting to be picked up by a
+            // `watch`, 0 once one has consumed it. Persisting the *pending* bit
+            // (rather than just comparing timestamps) is what makes the click
+            // durable — a reviewer can click with no watcher running at all and
+            // the next `watch` to connect still sees it.
+            (
+                "blueprints",
+                "finish_pending",
+                "ALTER TABLE blueprints ADD COLUMN finish_pending INTEGER NOT NULL DEFAULT 0",
+            ),
         ] {
             let exists: bool = conn
                 .query_row(
@@ -394,6 +412,64 @@ impl Store {
             )
             .optional()?;
         Ok(v.map(|n| n as u64))
+    }
+
+    /// Stamp "the reviewer clicked Finish Review" and raise the pending latch.
+    /// Returns the timestamp written. `Err(NotFound)` for an unknown slug.
+    /// Re-finishing is allowed and simply re-raises the latch, so a reviewer who
+    /// keeps going after finishing can end a later round too.
+    pub fn mark_finished(&self, slug: &str) -> Result<i64, AppError> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE blueprints SET finished_at = ?1, finish_pending = 1 WHERE slug = ?2",
+            params![now, slug],
+        )?;
+        if rows == 0 {
+            return Err(AppError::NotFound);
+        }
+        Ok(now)
+    }
+
+    /// Claim a pending finish, if there is one: returns `Some(finished_at)` and
+    /// lowers the latch, or `None` if no finish is waiting. `Err(NotFound)` for
+    /// an unknown slug.
+    ///
+    /// The clear is a single conditional UPDATE, so it's atomic — with several
+    /// waiters parked on one slug exactly one of them claims the finish, and a
+    /// later review round sees a lowered latch and parks correctly.
+    pub fn claim_finish(&self, slug: &str) -> Result<Option<i64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let claimed = conn.execute(
+            "UPDATE blueprints SET finish_pending = 0 WHERE slug = ?1 AND finish_pending = 1",
+            params![slug],
+        )? == 1;
+        if !claimed {
+            // Distinguish "nothing pending" from "no such blueprint".
+            let exists = read_version(&conn, slug)?.is_some();
+            return if exists { Ok(None) } else { Err(AppError::NotFound) };
+        }
+        conn.query_row(
+            "SELECT finished_at FROM blueprints WHERE slug = ?1",
+            params![slug],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .ok_or(AppError::NotFound)
+    }
+
+    /// When this blueprint was last finished, regardless of whether a waiter has
+    /// claimed it. `Ok(None)` means never finished; `Err(NotFound)` means the
+    /// slug doesn't exist. Drives the reviewer header's durable finished state.
+    pub fn finished_at(&self, slug: &str) -> Result<Option<i64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT finished_at FROM blueprints WHERE slug = ?1",
+            params![slug],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .ok_or(AppError::NotFound)
     }
 
     /// All version numbers for a blueprint (archived + the live one),

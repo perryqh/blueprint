@@ -516,11 +516,15 @@ async fn build_comments_response(
     let server_ts = crate::store::now_ms();
     let blueprint_version = state.blueprint_version(slug);
     let batch_processing = state.current_batch_processing(slug).await;
+    // A missing/unknown slug reads as "not finished" — this response is built on
+    // paths that have already established the blueprint exists.
+    let finished_at = state.store.finished_at(slug).ok().flatten();
     CommentsResponse {
         comments,
         server_ts,
         blueprint_version,
         batch_processing,
+        finished_at,
     }
 }
 
@@ -535,6 +539,11 @@ struct CommentsResponse {
     /// so older clients that don't know about it see the same shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_processing: Option<BatchProcessing>,
+    /// When this blueprint was last marked finished, or `None` if never. Lets
+    /// the reviewer header show a durable "finished" state that survives a
+    /// reload, instead of a toast that vanishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -746,17 +755,25 @@ async fn create_reply(
     Ok(Json(comment))
 }
 
+#[derive(Serialize)]
+struct FinishResponse {
+    finished_at: i64,
+}
+
+/// `POST /api/blueprints/:slug/finish` — the reviewer is done with this round.
+/// Persists the timestamp *first*, then wakes any parked `/wait`. The write is
+/// what makes this durable: the broadcast is only a wakeup nudge, and
+/// `broadcast::send` fails silently when nobody is subscribed, so a click with
+/// no `watch` running would otherwise vanish.
 async fn finish_review(
     State(state): State<AppState>,
     _w: crate::auth::WriteIdentity,
     Path(slug): Path<String>,
-) -> Result<StatusCode, AppError> {
-    if state.store.get_blueprint(&slug)?.is_none() {
-        return Err(AppError::NotFound);
-    }
+) -> Result<Json<FinishResponse>, AppError> {
+    let finished_at = state.store.mark_finished(&slug)?;
     let sender = state.finish_sender(&slug).await;
     let _ = sender.send(());
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(FinishResponse { finished_at }))
 }
 
 #[derive(Deserialize)]
@@ -800,22 +817,47 @@ async fn set_resolved(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Long-poll endpoint that blocks until the reviewer clicks Finish Review.
+///
+/// Consumes a *persisted latch* rather than waiting on a live signal, which is
+/// what makes the button durable: the reviewer can click with no `watch` running
+/// at all, and the next one to connect claims it immediately. Claiming lowers
+/// the latch, so a subsequent review round parks properly instead of being ended
+/// instantly by the previous round's click.
+///
+/// Subscribes BEFORE the first claim attempt so a finish arriving between the
+/// claim and the park is caught by the subscription rather than dropped.
 async fn wait_for_finish(
     State(state): State<AppState>,
     Path(slug): Path<String>,
-) -> Result<StatusCode, AppError> {
-    if state.store.get_blueprint(&slug)?.is_none() {
-        return Err(AppError::NotFound);
+) -> Result<Json<FinishResponse>, AppError> {
+    let sender = state.finish_sender(&slug).await;
+    let mut rx = sender.subscribe();
+
+    // Fast path: a click is already waiting. Doubles as the existence check —
+    // `claim_finish` is `Err(NotFound)` for an unknown slug.
+    if let Some(finished_at) = state.store.claim_finish(&slug)? {
+        return Ok(Json(FinishResponse { finished_at }));
     }
+
+    // Slow path: park until a finish is broadcast. Bound the connections held
+    // here — acquired only on the slow path so fast-path claims never trip it.
     let _permit = state
         .held
         .clone()
         .try_acquire_owned()
         .map_err(|_| AppError::TooManyConnections)?;
-    let sender = state.finish_sender(&slug).await;
-    let mut rx = sender.subscribe();
-    let _ = rx.recv().await;
-    Ok(StatusCode::NO_CONTENT)
+    loop {
+        if rx.recv().await.is_err() {
+            // Sender dropped (daemon shutting down) — nothing more will arrive.
+            return Err(AppError::NotFound);
+        }
+        // The broadcast is only a nudge; the latch is authoritative. If another
+        // waiter claimed this finish first, keep parking.
+        if let Some(finished_at) = state.store.claim_finish(&slug)? {
+            return Ok(Json(FinishResponse { finished_at }));
+        }
+    }
 }
 
 #[derive(Deserialize)]
