@@ -397,33 +397,27 @@ impl Store {
     }
 
     /// All version numbers for a blueprint (archived + the live one),
-    /// ascending. Empty for an unknown slug. Backs the reviewer's version
-    /// dropdown.
-    pub fn list_versions(&self, slug: &str) -> Result<Vec<u64>, AppError> {
+    /// ascending. `Err(NotFound)` for an unknown slug. Backs the reviewer's
+    /// version dropdown.
+    pub fn list_versions(&self, slug: &str) -> Result<(u64, Vec<u64>), AppError> {
         let conn = self.conn.lock().unwrap();
-        let current: Option<i64> = conn
-            .query_row(
-                "SELECT version FROM blueprints WHERE slug = ?1",
-                params![slug],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(current) = current else {
-            return Ok(vec![]);
-        };
+        // One query: the archive holds every superseded version and the live
+        // row holds the current one. UNION dedups; ORDER BY sorts. The live
+        // version is always the max, so `current` falls out of the last row —
+        // no separate lookup. Empty result ⇒ unknown slug.
         let mut stmt = conn.prepare(
-            "SELECT version FROM blueprint_versions WHERE slug = ?1 ORDER BY version ASC",
+            "SELECT version FROM blueprint_versions WHERE slug = ?1
+             UNION SELECT version FROM blueprints WHERE slug = ?1
+             ORDER BY version ASC",
         )?;
-        let rows = stmt.query_map(params![slug], |r| r.get::<_, i64>(0))?;
-        let mut versions: Vec<i64> = Vec::new();
-        for r in rows {
-            versions.push(r?);
-        }
-        // The live version isn't copied into the archive, so add it explicitly.
-        versions.push(current);
-        versions.sort_unstable();
-        versions.dedup();
-        Ok(versions.into_iter().map(|v| v as u64).collect())
+        let versions: Vec<u64> = stmt
+            .query_map(params![slug], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?
+            .into_iter()
+            .map(|v| v as u64)
+            .collect();
+        let current = *versions.last().ok_or(AppError::NotFound)?;
+        Ok((current, versions))
     }
 
     /// HTML for a specific version. Serves the live row when `version` matches
@@ -566,13 +560,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         // Stamp the version the comment is being written against, read under
         // the same lock so it can't race an interleaved update.
-        let blueprint_version: Option<i64> = conn
-            .query_row(
-                "SELECT version FROM blueprints WHERE slug = ?1",
-                params![slug],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let blueprint_version = read_version(&conn, slug)?;
         conn.execute(
             "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent, blueprint_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
@@ -654,13 +642,7 @@ impl Store {
 
         // All comments in a Submit-all batch are stamped with the same version
         // — the one live when the batch landed. Read once under the tx.
-        let blueprint_version: Option<i64> = tx
-            .query_row(
-                "SELECT version FROM blueprints WHERE slug = ?1",
-                params![slug],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let blueprint_version = read_version(&tx, slug)?;
 
         let mut out = Vec::with_capacity(drafts.len());
         let mut parents_to_clear: std::collections::HashSet<String> =
@@ -782,6 +764,20 @@ impl Store {
         )?;
         Ok(n > 0)
     }
+}
+
+/// Read a blueprint's current version under an existing connection or
+/// transaction, for stamping onto a comment at write time. `None` for an
+/// unknown slug. Shared by `add_comment` and `add_comments_batch` so the
+/// stamp semantics live in one place.
+fn read_version(conn: &Connection, slug: &str) -> Result<Option<i64>, AppError> {
+    Ok(conn
+        .query_row(
+            "SELECT version FROM blueprints WHERE slug = ?1",
+            params![slug],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {

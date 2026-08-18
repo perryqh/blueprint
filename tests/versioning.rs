@@ -4,41 +4,10 @@
 //! overwriting it, comments keep the version they were authored against, and
 //! `/raw?version=N` serves the exact snapshot a comment anchored to.
 
-use blueprint::server::{AppState, router};
-use blueprint::store::Store;
+mod common;
+
+use common::{client, selector, spawn};
 use serde_json::{Value, json};
-use std::sync::Arc;
-use std::time::Duration;
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-
-struct TestServer {
-    base: String,
-    _tmp: TempDir,
-}
-
-async fn spawn() -> TestServer {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(Store::open(&tmp.path().join("blueprints.db")).expect("store"));
-    let app = router(AppState::with_auth(store, None));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    TestServer { base, _tmp: tmp }
-}
-
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
-}
-
-fn selector(exact: &str) -> Value {
-    json!({ "type": "TextQuoteSelector", "exact": exact, "prefix": "", "suffix": "" })
-}
 
 #[tokio::test]
 async fn update_archives_prior_html_and_pins_comment_versions() {

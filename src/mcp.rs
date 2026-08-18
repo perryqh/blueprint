@@ -16,6 +16,7 @@
 use crate::cli::{base_url, cli_http_client, ensure_daemon, require_running};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -54,7 +55,7 @@ pub async fn run() -> Result<()> {
             "initialize" => initialize_result(&id),
             "tools/list" => tools_list_result(&id),
             "tools/call" => tools_call_result(&id, msg.get("params")).await,
-            "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            "ping" => ok_response(&id, json!({})),
             other => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -70,24 +71,26 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Wrap a result payload in the JSON-RPC 2.0 success envelope. One place so the
+/// envelope shape can't drift between the initialize/tools-list/tools-call/ping
+/// responses.
+fn ok_response(id: &Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
 fn initialize_result(id: &Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
+    ok_response(
+        id,
+        json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "blueprint", "version": env!("CARGO_PKG_VERSION") }
-        }
-    })
+        }),
+    )
 }
 
 fn tools_list_result(id: &Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": { "tools": tool_specs() }
-    })
+    ok_response(id, json!({ "tools": tool_specs() }))
 }
 
 /// The five tools, mirroring the CLI surface. Schemas are intentionally small:
@@ -165,19 +168,14 @@ async fn tools_call_result(id: &Value, params: Option<&Value>) -> Value {
         .unwrap_or_else(|| json!({}));
 
     match dispatch(name, args).await {
-        Ok(text) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": { "content": [{ "type": "text", "text": text }] }
-        }),
-        Err(e) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
+        Ok(text) => ok_response(id, json!({ "content": [{ "type": "text", "text": text }] })),
+        Err(e) => ok_response(
+            id,
+            json!({
                 "content": [{ "type": "text", "text": format!("error: {e}") }],
                 "isError": true
-            }
-        }),
+            }),
+        ),
     }
 }
 
@@ -199,22 +197,27 @@ fn req_str(args: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("`{key}` is required"))
 }
 
-/// Drain a reqwest response, erroring with status + body on non-2xx so the
-/// model sees the daemon's actual complaint (e.g. a 413 or a validation 400).
+/// A process-wide reqwest client. `cli_http_client` rebuilds headers (bearer
+/// token, cwd) that are fixed for this process's lifetime, so build it once and
+/// clone — `reqwest::Client` is `Arc`-backed, so cloning is cheap — instead of
+/// reconstructing the whole stack on every tool call.
+fn http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(cli_http_client).clone()
+}
+
+/// Drain a reqwest response into its body text, erroring with status + body on
+/// non-2xx so the model sees the daemon's actual complaint (e.g. a 413 or a
+/// validation 400). Reuses the CLI's `ensure_success` for the error shape.
 async fn body_or_err(resp: reqwest::Response, what: &str) -> Result<String> {
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("{what} failed: {status} {text}");
-    }
-    Ok(text)
+    Ok(crate::cli::ensure_success(resp, what).await?.text().await?)
 }
 
 async fn publish(args: Value) -> Result<String> {
     let html = req_str(&args, "html")?;
     let slug = args.get("slug").and_then(Value::as_str);
     let info = ensure_daemon().await?;
-    let resp = cli_http_client()
+    let resp = http_client()
         .post(format!("{}/api/blueprints", base_url(&info)))
         .json(&json!({ "html": html, "slug": slug }))
         .send()
@@ -233,7 +236,7 @@ async fn update(args: Value) -> Result<String> {
     let slug = req_str(&args, "slug")?;
     let html = req_str(&args, "html")?;
     let info = require_running()?;
-    let resp = cli_http_client()
+    let resp = http_client()
         .put(format!("{}/api/blueprints/{}", base_url(&info), slug))
         .json(&json!({ "html": html }))
         .send()
@@ -246,7 +249,7 @@ async fn wait_for_comments(args: Value) -> Result<String> {
     let slug = req_str(&args, "slug")?;
     let since = args.get("since").and_then(Value::as_i64).unwrap_or(0);
     let info = require_running()?;
-    let resp = cli_http_client()
+    let resp = http_client()
         .get(format!(
             "{}/api/blueprints/{}/wait-comment?since={}",
             base_url(&info),
@@ -270,7 +273,7 @@ async fn reply(args: Value) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("Claude Code");
     let info = require_running()?;
-    let resp = cli_http_client()
+    let resp = http_client()
         .post(format!(
             "{}/api/blueprints/{}/comments/{}/replies",
             base_url(&info),
@@ -285,7 +288,7 @@ async fn reply(args: Value) -> Result<String> {
 
 async fn list() -> Result<String> {
     let info = require_running()?;
-    let resp = cli_http_client()
+    let resp = http_client()
         .get(format!("{}/api/blueprints", base_url(&info)))
         .send()
         .await?;

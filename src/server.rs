@@ -190,7 +190,7 @@ impl AppState {
     /// for an unknown slug so callers can treat "missing" as version 0. The
     /// frontend polls this off the comments response to show the "Blueprint
     /// updated" banner when it increments.
-    pub async fn blueprint_version(&self, slug: &str) -> u64 {
+    pub fn blueprint_version(&self, slug: &str) -> u64 {
         self.store
             .get_blueprint_version(slug)
             .ok()
@@ -465,11 +465,7 @@ async fn list_blueprint_versions(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Json<VersionsResponse>, AppError> {
-    let current = state
-        .store
-        .get_blueprint_version(&slug)?
-        .ok_or(AppError::NotFound)?;
-    let versions = state.store.list_versions(&slug)?;
+    let (current, versions) = state.store.list_versions(&slug)?;
     Ok(Json(VersionsResponse { current, versions }))
 }
 
@@ -518,7 +514,7 @@ async fn build_comments_response(
     comments: Vec<Comment>,
 ) -> CommentsResponse {
     let server_ts = crate::store::now_ms();
-    let blueprint_version = state.blueprint_version(slug).await;
+    let blueprint_version = state.blueprint_version(slug);
     let batch_processing = state.current_batch_processing(slug).await;
     CommentsResponse {
         comments,

@@ -44,7 +44,10 @@ fn read_cli_token() -> Option<String> {
 /// status code AND the response body, so the CLI surfaces a useful error
 /// instead of just "400 Bad Request". Returns `Ok(resp)` on success so calls
 /// can chain through to `.json()` etc.
-async fn ensure_success(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+pub(crate) async fn ensure_success(
+    resp: reqwest::Response,
+    what: &str,
+) -> Result<reqwest::Response> {
     if resp.status().is_success() {
         return Ok(resp);
     }

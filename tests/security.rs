@@ -1,37 +1,11 @@
 //! Security hardening (Step 1): CSP sandbox header on /raw, request-body cap,
 //! and the held-connection ceiling on long-poll endpoints.
 
-use blueprint::server::{AppState, router};
-use blueprint::store::Store;
+mod common;
+
+use common::{client, spawn};
 use serde_json::json;
-use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-
-struct TestServer {
-    base: String,
-    _tmp: TempDir,
-}
-
-async fn spawn() -> TestServer {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(Store::open(&tmp.path().join("blueprints.db")).expect("store"));
-    let app = router(AppState::with_auth(store, None));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    TestServer { base, _tmp: tmp }
-}
-
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap()
-}
 
 async fn publish(http: &reqwest::Client, base: &str, slug: &str) {
     http.post(format!("{base}/api/blueprints"))
