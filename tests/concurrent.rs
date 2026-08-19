@@ -8,45 +8,11 @@
 //!
 //! Run with: `cargo test --release --test concurrent`.
 
-use blueprint::server::{AppState, router};
-use blueprint::store::Store;
+mod common;
+
+use common::{client as http, spawn, wait_for_parked_pollers};
 use serde_json::{Value, json};
-use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-use tokio::sync::Notify;
-
-struct Harness {
-    base: String,
-    shutdown: Arc<Notify>,
-    _tmp: TempDir,
-}
-
-async fn spawn() -> Harness {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(tmp.path().join("blueprints.db")).unwrap());
-    let state = AppState::with_auth(store, None);
-    let shutdown = state.shutdown.clone();
-    let app = router(state);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    Harness {
-        base,
-        shutdown,
-        _tmp: tmp,
-    }
-}
-
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
-}
 
 #[tokio::test]
 async fn shutdown_if_empty_returns_204_and_fires_notify_when_no_plans() {
@@ -54,7 +20,7 @@ async fn shutdown_if_empty_returns_204_and_fires_notify_when_no_plans() {
     let c = http();
 
     // notified() must be created before notify_one() to receive the signal.
-    let waiter = h.shutdown.clone();
+    let waiter = h.state.shutdown.clone();
     let notified = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(2), waiter.notified())
             .await
@@ -87,7 +53,7 @@ async fn shutdown_if_empty_returns_409_and_keeps_running_when_plans_exist() {
     assert_eq!(r.status(), 200);
 
     // Subscribe to notify *before* posting so we can prove it never fires.
-    let waiter = h.shutdown.clone();
+    let waiter = h.state.shutdown.clone();
     let notified = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_millis(300), waiter.notified())
             .await
@@ -126,7 +92,7 @@ async fn concurrent_create_is_never_swallowed_by_shutdown() {
 
     // Arm the notify listener before racing, so we can tell afterwards whether
     // the shutdown path actually fired rather than inferring it from the status.
-    let waiter = h.shutdown.clone();
+    let waiter = h.state.shutdown.clone();
     let notified = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_millis(500), waiter.notified())
             .await
@@ -314,6 +280,7 @@ async fn batch_wakes_wait_for_comment_once_with_all_rows() {
         .unwrap();
 
     // Start the long-poll *first*, then submit the batch.
+    let sem = h.state.held_comment_polls.clone();
     let base = h.base.clone();
     let waiter = tokio::spawn(async move {
         http()
@@ -327,8 +294,11 @@ async fn batch_wakes_wait_for_comment_once_with_all_rows() {
             .unwrap()
     });
 
-    // Tiny pause so the waiter has subscribed before we send the batch.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The batch must not land before the waiter has subscribed, or it wakes
+    // nothing and this test proves nothing. A handler on the slow path holds a
+    // `held_comment_polls` permit for exactly as long as it's parked, so the
+    // permit count is a direct readiness signal — no sleeping and hoping.
+    wait_for_parked_pollers(&sem, 1).await;
 
     let payload = json!([
         { "author": "a", "body": "1",
@@ -405,7 +375,7 @@ async fn batch_with_unknown_parent_rejects_whole_batch() {
 /// drives the store directly — the layer that actually owns the guarantee.
 #[tokio::test]
 async fn batch_draft_may_reply_to_a_sibling_in_the_same_batch() {
-    use blueprint::store::{AuthorRole, CommentDraft};
+    use blueprint::store::{AuthorRole, CommentDraft, Store};
 
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path().join("blueprints.db")).unwrap();

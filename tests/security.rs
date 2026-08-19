@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{client, spawn};
+use common::{client, spawn, wait_for_parked_pollers};
 use serde_json::json;
 use std::time::Duration;
 
@@ -125,25 +125,30 @@ async fn oversize_body_is_rejected_with_413() {
 }
 
 #[tokio::test]
-async fn held_long_polls_are_capped_at_the_ceiling() {
+async fn held_comment_polls_are_capped_at_the_ceiling() {
     let s = spawn().await;
     let http = client();
     publish(&http, &s.base, "cap").await;
 
-    // Occupy all 32 permits with slow-path long-polls (no comments exist, so
-    // each parks on the ~30s timeout holding a permit). Fire-and-forget: the
-    // runtime aborts them when the test returns.
-    for _ in 0..32 {
+    let sem = s.state.held_comment_polls.clone();
+    let capacity = sem.available_permits();
+
+    // Occupy every permit with slow-path long-polls (no comments exist, so each
+    // parks on the ~30s timeout holding a permit). Fire-and-forget: the runtime
+    // aborts them when the test returns.
+    for _ in 0..capacity {
         let http = http.clone();
         let url = format!("{}/api/blueprints/cap/wait-comment?since=0", s.base);
         tokio::spawn(async move {
             let _ = http.get(url).send().await;
         });
     }
-    // Give the 32 a beat to acquire their permits.
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    // Poll the permit count rather than sleeping a fixed 750ms. The old sleep
+    // was both the flakiest thing in the suite (32 tasks may need longer under
+    // load) and a flat tax on every green run.
+    wait_for_parked_pollers(&sem, capacity).await;
 
-    // The 33rd is refused fast rather than pinning another connection.
+    // One more is refused fast rather than pinning another connection.
     let r = http
         .get(format!(
             "{}/api/blueprints/cap/wait-comment?since=0",
@@ -154,4 +159,66 @@ async fn held_long_polls_are_capped_at_the_ceiling() {
         .await
         .unwrap();
     assert_eq!(r.status(), 503, "over-ceiling long-poll must 503");
+}
+
+/// The reason `/wait` and `/wait-comment` no longer share a permit pool.
+///
+/// `/wait-comment` self-limits at ~30s; `/wait` parks for up to an hour. On one
+/// shared semaphore, 32 abandoned `blueprint watch` processes exhausted it
+/// permanently, and from that moment every reviewer comment long-poll 503'd —
+/// the comment stream died silently and stayed dead until the daemon restarted.
+/// Separate budgets mean saturating one endpoint cannot price out the other.
+#[tokio::test]
+async fn a_saturated_finish_wait_pool_does_not_starve_comment_polls() {
+    let s = spawn().await;
+    let http = client();
+    publish(&http, &s.base, "starve").await;
+
+    let finish_sem = s.state.held_finish_waits.clone();
+    let capacity = finish_sem.available_permits();
+
+    // Fill the finish-wait pool. Nothing finishes `starve`, so each parks.
+    for _ in 0..capacity {
+        let http = http.clone();
+        let url = format!("{}/api/blueprints/starve/wait", s.base);
+        tokio::spawn(async move {
+            let _ = http.get(url).send().await;
+        });
+    }
+    wait_for_parked_pollers(&finish_sem, capacity).await;
+
+    // A further /wait is correctly refused — the pool really is full.
+    let refused = http
+        .get(format!("{}/api/blueprints/starve/wait", s.base))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503, "the finish-wait pool is saturated");
+
+    // But a comment long-poll draws on its own budget and still works. Give it
+    // something to find so it returns on the fast path instead of parking for
+    // 30s: what's under test is that it isn't refused, not how long it waits.
+    http.post(format!("{}/api/blueprints/starve/comments", s.base))
+        .json(&json!({
+            "author": "alice", "body": "still listening",
+            "selector": { "type": "TextQuoteSelector", "exact": "hi" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let r = http
+        .get(format!(
+            "{}/api/blueprints/starve/wait-comment?since=0",
+            s.base
+        ))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "a saturated /wait pool must not 503 the comment stream"
+    );
 }

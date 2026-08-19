@@ -27,6 +27,27 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    # Catches the tail of the `plan-share` → `blueprint` rename that the compiler
+    # can't see: string literals in URLs, env-var names, help text, comments,
+    # docs, and frontend JS.
+    #
+    # This was a `#[test]` that walked the working tree on every `cargo test` —
+    # a lint in a test's clothing, whose runtime scaled with whatever happened to
+    # be sitting in the checkout and which could fail on an untracked local file.
+    # `git grep` only looks at tracked content, so it needs no skip-list for
+    # `target/` or `node_modules/`, and it costs a CI second instead of a
+    # tree-walk per test run.
+    #
+    # Cargo.lock is excluded because transitive dependency names legitimately
+    # contain these substrings.
+    - name: No stale plan-share references
+      run: |
+        if git grep -In -e 'plan-share' -e 'plan_share' -e 'PLAN_SHARE' \
+             -- '*.rs' '*.toml' '*.md' '*.js' '*.html' '*.css' '*.json' \
+             ':!Cargo.lock'; then
+          echo "::error::stale plan-share reference(s) above — drop or rename"
+          exit 1
+        fi
 
   # The anchoring algorithm lives in JavaScript, so it needs its own runner.
   # Split from the Rust job so a JS failure is legible at a glance.

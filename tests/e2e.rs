@@ -1,55 +1,17 @@
 //! End-to-end smoke test that exercises the §9 verification checklist
 //! against an in-process daemon. Mirrors what the CLI / browser would do.
 
-use blueprint::server::{AppState, router};
+mod common;
+
 use blueprint::store::Store;
+use common::oauth::{
+    MOCK_LOGIN, browser_client, location, login_via_mock, replay_session, session_cookie,
+    spawn_auth_daemon_with_store, spawn_mock_github, spawn_with_auth, spawn_with_auth_owner,
+};
+use common::{client, spawn, wait_for_parked_pollers};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-
-struct TestServer {
-    base: String,
-    _tmp: TempDir,
-}
-
-/// Bind a fresh listener on an OS-assigned port, returning the listener and
-/// its `http://addr/` base URL.
-async fn bind_listener() -> (TcpListener, String) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    (listener, format!("http://{}", addr))
-}
-
-/// Spawn a daemon on the given listener with a fresh SQLite store. Shared by
-/// `spawn` (legacy/no-auth) and `spawn_with_auth` (GitHub OAuth enabled).
-async fn spawn_daemon_on(
-    listener: TcpListener,
-    auth: Option<Arc<blueprint::auth::AuthConfig>>,
-) -> TempDir {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(Store::open(tmp.path().join("blueprints.db")).expect("open store"));
-    let state = AppState::with_auth(store, auth);
-    let app = router(state);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    tmp
-}
-
-async fn spawn() -> TestServer {
-    let (listener, base) = bind_listener().await;
-    let tmp = spawn_daemon_on(listener, None).await;
-    TestServer { base, _tmp: tmp }
-}
-
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
-}
 
 #[tokio::test]
 async fn publish_comment_reply_finish_fetch_drift_unpublish() {
@@ -723,7 +685,13 @@ async fn wait_for_comment_returns_existing_immediately() {
         .await
         .unwrap();
 
-    let start = std::time::Instant::now();
+    // "Immediately" used to be asserted as `elapsed < 200ms`, which measures the
+    // CI runner's load rather than the handler. What actually distinguishes the
+    // fast path is *structural*: it returns before reaching the park, so it never
+    // takes a long-poll permit. Assert that instead — it's the real property, and
+    // it holds however slow the machine is.
+    let sem = &s.state.held_comment_polls;
+    let idle = sem.available_permits();
     let r: Value = http
         .get(format!("{}/api/blueprints/p1/wait-comment?since=0", s.base))
         .send()
@@ -732,11 +700,10 @@ async fn wait_for_comment_returns_existing_immediately() {
         .json()
         .await
         .unwrap();
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed.as_millis() < 200,
-        "fast path should be near-instant, took {elapsed:?}"
+    assert_eq!(
+        sem.available_permits(),
+        idle,
+        "the fast path must return without ever acquiring a long-poll permit"
     );
     let comments = r["comments"].as_array().unwrap();
     assert_eq!(comments.len(), 1);
@@ -766,44 +733,45 @@ async fn wait_for_comment_unblocks_on_new_comment() {
         .unwrap();
     let since = listing["server_ts"].as_i64().unwrap();
 
-    // Post a comment after a short delay, racing the wait.
+    // Park the long-poll first, then post. Previously this raced a 150ms sleep
+    // against the request and asserted `elapsed < 1500ms` — which passes even if
+    // the handler never parked at all (it would just have returned on the fast
+    // path), and fails on a loaded runner even when the code is perfect.
+    //
+    // The properties worth asserting are that the request genuinely reached the
+    // slow path, and that a later comment woke it with the right payload. Both
+    // are structural: the permit count proves the park, the response proves the
+    // wake, and neither depends on how fast the machine is.
+    let sem = s.state.held_comment_polls.clone();
     let base = s.base.clone();
-    let poster = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+    let waiter = tokio::spawn(async move {
         reqwest::Client::new()
-            .post(format!("{}/api/blueprints/p2/comments", base))
-            .json(&json!({
-                "author": "x", "body": "live!",
-                "selector": { "type": "TextQuoteSelector", "exact": "x" }
-            }))
+            .get(format!(
+                "{base}/api/blueprints/p2/wait-comment?since={since}"
+            ))
+            .timeout(Duration::from_secs(10))
             .send()
             .await
-            .unwrap();
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
     });
+    wait_for_parked_pollers(&sem, 1).await;
 
-    let start = std::time::Instant::now();
-    let r: Value = http
-        .get(format!(
-            "{}/api/blueprints/p2/wait-comment?since={}",
-            s.base, since
-        ))
-        .timeout(Duration::from_secs(3))
+    http.post(format!("{}/api/blueprints/p2/comments", s.base))
+        .json(&json!({
+            "author": "x", "body": "live!",
+            "selector": { "type": "TextQuoteSelector", "exact": "x" }
+        }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    let elapsed = start.elapsed();
 
-    assert!(
-        elapsed.as_millis() < 1500,
-        "slow-path should unblock within ~1s, took {elapsed:?}"
-    );
+    let r = waiter.await.unwrap();
     let comments = r["comments"].as_array().unwrap();
     assert_eq!(comments.len(), 1);
     assert_eq!(comments[0]["body"], "live!");
-    poster.await.unwrap();
 }
 
 #[tokio::test]
@@ -884,161 +852,123 @@ async fn review_file_shape_is_crit_compatible() {
     assert_eq!(c["anchor"]["exact"], "the quote");
     assert_eq!(c["replies"].as_array().unwrap().len(), 1);
     assert_eq!(c["replies"][0]["author"], "bob");
+    // `start_line`/`end_line` are structurally 0 — a blueprint comment anchors to
+    // a quote, not a line. Asserted so the zeros read as the format's contract
+    // rather than as an unfinished field somebody should go fill in.
+    assert_eq!(c["start_line"], 0);
+    assert_eq!(c["end_line"], 0);
+}
+
+/// A reply to a reply must reach the file Claude reads.
+///
+/// This was a real drop, not a design choice. `replies_by_parent` was built from
+/// every comment but only drained for ids in `tops`, so anything below the first
+/// level fell out — while `frontend/render.js` recurses through `byParent` and
+/// renders those nested replies happily. The reviewer saw their comment; the
+/// agent never did.
+#[tokio::test]
+async fn review_file_includes_replies_nested_below_the_first_level() {
+    use blueprint::review_file;
+    use blueprint::selector::TextQuoteSelector;
+
+    let selector = TextQuoteSelector {
+        ty: "TextQuoteSelector".into(),
+        exact: "q".into(),
+        prefix: None,
+        suffix: None,
+    };
+    let top = test_comment("c_top", "alice", "head", selector.clone(), None, 1);
+    let reply = test_comment(
+        "c_r1",
+        "claude",
+        "first-level reply",
+        selector.clone(),
+        Some("c_top".into()),
+        2,
+    );
+    let nested = test_comment(
+        "c_r2",
+        "alice",
+        "reply to the reply",
+        selector.clone(),
+        Some("c_r1".into()),
+        3,
+    );
+    // Two levels down, to prove the walk recurses rather than special-casing one
+    // extra level.
+    let deeper = test_comment(
+        "c_r3",
+        "claude",
+        "and again",
+        selector,
+        Some("c_r2".into()),
+        4,
+    );
+
+    let rf = review_file::build("p", vec![top, reply, nested, deeper]);
+    let v = serde_json::to_value(&rf).unwrap();
+    let comments = v["files"]["p.html"]["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1, "still one top-level thread");
+
+    // Flattened depth-first, so the sub-thread stays contiguous and in order.
+    let ids: Vec<&str> = comments[0]["replies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["c_r1", "c_r2", "c_r3"],
+        "every reply in the subtree must be present, depth-first"
+    );
+}
+
+/// A reply whose parent isn't in the input at all is dropped, deliberately.
+///
+/// Not reachable from the daemon today — `comments.parent_id` is
+/// `ON DELETE CASCADE`, so deleting a parent takes its replies with it, and
+/// `blueprint fetch` sends no `since` so it always gets the whole thread. But
+/// `build` is a pure function over whatever slice it's handed, and a caller that
+/// passed a `since`-filtered slice would produce exactly this. Rendering a reply
+/// with no context under an arbitrary thread would be worse than omitting it, so
+/// the drop is the right call — this test makes it a decision on the record
+/// rather than an accident of the loop structure.
+#[tokio::test]
+async fn review_file_drops_a_reply_whose_parent_is_absent_from_the_input() {
+    use blueprint::review_file;
+    use blueprint::selector::TextQuoteSelector;
+
+    let selector = TextQuoteSelector {
+        ty: "TextQuoteSelector".into(),
+        exact: "q".into(),
+        prefix: None,
+        suffix: None,
+    };
+    let top = test_comment("c_top", "alice", "head", selector.clone(), None, 1);
+    let stray = test_comment(
+        "c_stray",
+        "bob",
+        "parent not in this slice",
+        selector,
+        Some("c_never_supplied".into()),
+        2,
+    );
+
+    let rf = review_file::build("p", vec![top, stray]);
+    let v = serde_json::to_value(&rf).unwrap();
+    let comments = v["files"]["p.html"]["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["id"], "c_top");
+    assert!(
+        comments[0]["replies"].as_array().unwrap().is_empty(),
+        "an unparentable reply must not be reattached to an unrelated thread"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // OAuth + auth-gate tests
 // ---------------------------------------------------------------------------
-
-use axum::Json as AxumJson;
-use axum::extract::Query as AxumQuery;
-use axum::response::Redirect;
-use axum::routing::{get, post};
-use blueprint::auth::AuthConfig;
-use std::collections::HashMap;
-
-struct AuthedTest {
-    daemon_base: String,
-    cli_token: String,
-    _tmp: TempDir,
-}
-
-const TEST_CLI_TOKEN: &str = "test-cli-token-deadbeef";
-
-/// Spawn an in-process mock GitHub and return its base URL.
-async fn spawn_mock_github() -> String {
-    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mock_addr = mock_listener.local_addr().unwrap();
-    let mock_app = axum::Router::new()
-        .route("/login/oauth/authorize", get(mock_authorize))
-        .route("/login/oauth/access_token", post(mock_token))
-        .route("/user", get(mock_user));
-    tokio::spawn(async move {
-        let _ = axum::serve(mock_listener, mock_app).await;
-    });
-    format!("http://{}", mock_addr)
-}
-
-/// Spawn an auth-enabled daemon over a caller-supplied store, with its OAuth
-/// endpoints pointed at `mock_base`. Taking the store lets a test stand up a
-/// *second* daemon over the same database to simulate a restart.
-async fn spawn_auth_daemon_with_store(store: Arc<Store>, mock_base: &str) -> String {
-    // AuthConfig.callback_url needs the daemon URL, so bind first.
-    let (listener, daemon_base) = bind_listener().await;
-    let auth = AuthConfig {
-        client_id: "test-client".into(),
-        client_secret: "test-secret".into(),
-        callback_url: format!("{}/auth/github/callback", daemon_base),
-        enabled: true,
-        authorize_url: format!("{}/login/oauth/authorize", mock_base),
-        token_url: format!("{}/login/oauth/access_token", mock_base),
-        profile_url: format!("{}/user", mock_base),
-        cli_token: TEST_CLI_TOKEN.into(),
-        owner_login: None,
-    };
-    let app = router(AppState::with_auth(store, Some(Arc::new(auth))));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    daemon_base
-}
-
-/// Spawn a daemon with auth enabled, plus an in-process mock GitHub server.
-/// The daemon's AuthConfig.oauth_* URLs point at the mock.
-async fn spawn_with_auth() -> AuthedTest {
-    let mock_base = spawn_mock_github().await;
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(Store::open(tmp.path().join("blueprints.db")).expect("open store"));
-    let daemon_base = spawn_auth_daemon_with_store(store, &mock_base).await;
-
-    AuthedTest {
-        daemon_base,
-        cli_token: TEST_CLI_TOKEN.into(),
-        _tmp: tmp,
-    }
-}
-
-/// `Location` header of a redirect response, as an owned String.
-fn location(r: &reqwest::Response) -> String {
-    r.headers()
-        .get("location")
-        .expect("redirect has a Location")
-        .to_str()
-        .unwrap()
-        .to_string()
-}
-
-/// The `ps_session=<value>` pair from a response's `Set-Cookie`, if it set one.
-fn session_cookie(r: &reqwest::Response) -> Option<String> {
-    r.headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find_map(|v| v.split(';').next().filter(|p| p.starts_with("ps_session=")))
-        .map(|p| p.to_string())
-}
-
-/// Send `cookie` to `/api/me` from a client holding no other state — replaying a
-/// captured session id the way a stale tab or a copied cookie would.
-async fn replay_session(base: &str, cookie: &str) -> reqwest::StatusCode {
-    client()
-        .get(format!("{base}/api/me"))
-        .header("cookie", cookie)
-        .send()
-        .await
-        .unwrap()
-        .status()
-}
-
-/// Drive the full mock-GitHub round trip on `http`, returning the session
-/// cookie the daemon ended up issuing.
-async fn login_via_mock(http: &reqwest::Client, base: &str) -> String {
-    let r1 = http.get(format!("{base}/login")).send().await.unwrap();
-    let issued = session_cookie(&r1);
-    let r2 = http.get(location(&r1)).send().await.unwrap();
-    let r3 = http.get(location(&r2)).send().await.unwrap();
-    assert_eq!(r3.status(), 303, "callback should complete the login");
-    // The callback re-saves the session; it only re-issues the cookie if the id
-    // changed, so fall back to the one /login handed out.
-    session_cookie(&r3)
-        .or(issued)
-        .expect("login issues a session cookie")
-}
-
-async fn mock_authorize(AxumQuery(p): AxumQuery<HashMap<String, String>>) -> Redirect {
-    // GitHub would render a consent UI here; we just bounce straight back to the
-    // daemon's callback URL with a synthetic code, preserving the state nonce.
-    let redirect_uri = p.get("redirect_uri").cloned().unwrap_or_default();
-    let state = p.get("state").cloned().unwrap_or_default();
-    Redirect::to(&format!("{}?code=mock-code&state={}", redirect_uri, state))
-}
-
-async fn mock_token() -> AxumJson<Value> {
-    AxumJson(json!({
-        "access_token": "mock-access-token",
-        "token_type": "bearer",
-        "scope": "read:user"
-    }))
-}
-
-async fn mock_user() -> AxumJson<Value> {
-    AxumJson(json!({
-        "id": 4242,
-        "login": "mockuser",
-        "name": "Mock User",
-        "avatar_url": "https://example.com/mockuser.png"
-    }))
-}
-
-/// A reqwest client with a cookie jar and *no* automatic redirect following — we
-/// need to inspect the 302 from /login and the 302 from /callback.
-fn browser_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .cookie_store(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap()
-}
 
 #[tokio::test]
 async fn oauth_login_redirects_to_authorize_with_state() {
@@ -1488,7 +1418,7 @@ async fn cli_bearer_comment_lands_with_role_user_and_is_agent_true() {
 async fn session_non_owner_lands_as_user_role() {
     let s = spawn_with_auth().await;
     let http = browser_client();
-    oauth_round_trip(&http, &s.daemon_base).await;
+    login_via_mock(&http, &s.daemon_base).await;
 
     let me: Value = http
         .get(format!("{}/api/me", s.daemon_base))
@@ -1531,9 +1461,9 @@ async fn session_non_owner_lands_as_user_role() {
 /// role: "owner", is_owner: true on /api/me.
 #[tokio::test]
 async fn session_owner_lands_as_owner_role() {
-    let s = spawn_with_auth_owner("mockuser").await;
+    let s = spawn_with_auth_owner(Some(MOCK_LOGIN)).await;
     let http = browser_client();
-    oauth_round_trip(&http, &s.daemon_base).await;
+    login_via_mock(&http, &s.daemon_base).await;
 
     let me: Value = http
         .get(format!("{}/api/me", s.daemon_base))
@@ -1574,9 +1504,9 @@ async fn session_owner_lands_as_owner_role() {
 /// care whether the env var was written with the same casing as the GH login.
 #[tokio::test]
 async fn owner_login_match_is_case_insensitive() {
-    let s = spawn_with_auth_owner("MockUser").await;
+    let s = spawn_with_auth_owner(Some("MockUser")).await;
     let http = browser_client();
-    oauth_round_trip(&http, &s.daemon_base).await;
+    login_via_mock(&http, &s.daemon_base).await;
 
     let me: Value = http
         .get(format!("{}/api/me", s.daemon_base))
@@ -1839,19 +1769,13 @@ async fn batch_processing_ttl_evicts_stale_entries() {
     use std::collections::HashSet;
 
     // Reach into AppState directly so we can implant an entry that's already
-    // older than the TTL — no point waiting 5 real minutes in a unit test.
-    let (listener, base) = bind_listener().await;
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(
-        blueprint::store::Store::open(tmp.path().join("blueprints.db")).expect("open store"),
-    );
-    let state = blueprint::server::AppState::with_auth(store.clone(), None);
-    let app = blueprint::server::router(state.clone());
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    // older than the TTL — no point waiting 5 real minutes in a unit test. The
+    // shared harness hands back the live state, so no bespoke spawn is needed.
+    let s = spawn().await;
+    let (base, state) = (&s.base, &s.state);
 
-    store
+    state
+        .store
         .insert_blueprint("ttl-test", b"<p>x</p>", "tok", None)
         .unwrap();
     // Implant a stale entry: started_at is 10 minutes ago.
@@ -1883,68 +1807,6 @@ async fn batch_processing_ttl_evicts_stale_entries() {
     // And the entry should be gone from state too (lazy eviction).
     let m = state.batch_processing.lock().await;
     assert!(!m.contains_key("ttl-test"));
-}
-
-/// Like spawn_with_auth but takes an owner login to plumb into AuthConfig.
-async fn spawn_with_auth_owner(owner: &str) -> AuthedTest {
-    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mock_addr = mock_listener.local_addr().unwrap();
-    let mock_base = format!("http://{}", mock_addr);
-    let mock_app = axum::Router::new()
-        .route("/login/oauth/authorize", get(mock_authorize))
-        .route("/login/oauth/access_token", post(mock_token))
-        .route("/user", get(mock_user));
-    tokio::spawn(async move {
-        let _ = axum::serve(mock_listener, mock_app).await;
-    });
-
-    let (listener, daemon_base) = bind_listener().await;
-    let cli_token = "test-cli-token-deadbeef".to_string();
-    let auth = AuthConfig {
-        client_id: "test-client".into(),
-        client_secret: "test-secret".into(),
-        callback_url: format!("{}/auth/github/callback", daemon_base),
-        enabled: true,
-        authorize_url: format!("{}/login/oauth/authorize", mock_base),
-        token_url: format!("{}/login/oauth/access_token", mock_base),
-        profile_url: format!("{}/user", mock_base),
-        cli_token: cli_token.clone(),
-        owner_login: Some(owner.to_string()),
-    };
-    let tmp = spawn_daemon_on(listener, Some(Arc::new(auth))).await;
-
-    AuthedTest {
-        daemon_base,
-        cli_token,
-        _tmp: tmp,
-    }
-}
-
-/// Walk the mock OAuth round-trip end-to-end so the browser_client cookie jar
-/// holds an authenticated session. Used by every role-test that needs to act
-/// as a logged-in user.
-async fn oauth_round_trip(http: &reqwest::Client, daemon_base: &str) {
-    let r1 = http
-        .get(format!("{}/login", daemon_base))
-        .send()
-        .await
-        .unwrap();
-    let authorize_url = r1
-        .headers()
-        .get("location")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let r2 = http.get(&authorize_url).send().await.unwrap();
-    let callback_url = r2
-        .headers()
-        .get("location")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let _ = http.get(&callback_url).send().await.unwrap();
 }
 
 #[tokio::test]

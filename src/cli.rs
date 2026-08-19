@@ -502,14 +502,28 @@ async fn watch(slug: String, stream: bool) -> Result<()> {
     // on start time would throw away exactly the case this is meant to survive.
     let url = format!("{}/api/blueprints/{}/wait", base_url(&info), slug);
     println!("Waiting for \"Finish Review\" on {}…", slug);
-    let resp = cli_http_client()
-        .get(&url)
-        .timeout(Duration::from_secs(60 * 60 * 4))
-        .send()
-        .await?;
-    ensure_success(resp, "watch").await?;
-    println!("Review complete.");
-    Ok(())
+
+    #[derive(serde::Deserialize)]
+    struct WaitResp {
+        finished_at: Option<i64>,
+    }
+
+    // The daemon caps each `/wait` at an hour so an abandoned watch eventually
+    // returns its long-poll slot. A capped poll answers `finished_at: null`,
+    // which means "nothing yet" — reconnect. Only a real timestamp ends the
+    // loop, so a reviewer who takes longer than one poll sees no difference.
+    loop {
+        let resp = cli_http_client()
+            .get(&url)
+            .timeout(Duration::from_secs(60 * 60 + 60))
+            .send()
+            .await?;
+        let body: WaitResp = ensure_success(resp, "watch").await?.json().await?;
+        if body.finished_at.is_some() {
+            println!("Review complete.");
+            return Ok(());
+        }
+    }
 }
 
 /// Loop: long-poll /wait-comment, print each new comment as a JSON line.

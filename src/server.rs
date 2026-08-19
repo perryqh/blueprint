@@ -22,12 +22,33 @@ use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
 /// generous for a self-contained plan page.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
-/// Ceiling on concurrently-held long-poll connections (`/wait`,
-/// `/wait-comment`). Each pins a socket for up to ~30s (comments) or hours
-/// (finish); unbounded, a flood exhausts the runtime. Sized for a real
-/// single-user workspace — a few viewer tabs plus active agent long-polls —
-/// so a genuine flood is refused while normal use never hits the wall.
-const MAX_HELD_CONNECTIONS: usize = 32;
+/// Ceiling on concurrently-held `/wait-comment` long-polls. Each pins a socket
+/// for up to ~30s; unbounded, a flood exhausts the runtime. Sized for a real
+/// single-user workspace — a few viewer tabs plus active agent long-polls — so
+/// a genuine flood is refused while normal use never hits the wall.
+const MAX_HELD_COMMENT_POLLS: usize = 32;
+
+/// Ceiling on concurrently-held `/wait` (finish) long-polls, budgeted
+/// *separately* from the comment polls above.
+///
+/// These two endpoints have wildly different holding times, so one shared pool
+/// let the long-lived one starve the short-lived one: 32 abandoned `blueprint
+/// watch` processes parked here permanently, and from then on every comment
+/// long-poll 503'd — silently killing the reviewer's comment stream until the
+/// daemon restarted. Separate budgets mean neither endpoint can price the other
+/// out.
+const MAX_HELD_FINISH_WAITS: usize = 32;
+
+/// Upper bound on how long a single `/wait` parks before returning "nothing
+/// yet". Without one, a dead client's permit was never reclaimed — the socket
+/// is gone but the daemon has no way to notice, so the slot leaked for the
+/// process's life.
+///
+/// An hour is far longer than any real review round, and the cost of hitting it
+/// is one extra round trip: `cli::watch` treats a `finished_at: null` response
+/// as "ask again" and immediately reconnects, so a reviewer who takes longer
+/// than this sees no difference.
+const FINISH_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// 5-minute TTL on a slug-level batch-processing entry. If the skill crashes
 /// between `start` and the last reply (and so never DELETE'd), the entry is
@@ -43,7 +64,6 @@ struct Assets;
 pub struct AppState {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<Event>,
-    pub finish_signals: Arc<Mutex<HashMap<String, broadcast::Sender<()>>>>,
     /// Per-slug "the agent is working on this batch" state, in-memory only.
     /// Set by `POST /api/blueprints/:slug/batch-processing` when the skill
     /// wakes on a Submit-all batch, cleared either explicitly via DELETE or
@@ -56,10 +76,13 @@ pub struct AppState {
     /// `daemon::run_foreground` selects on this alongside ctrl-c/SIGTERM so
     /// the HTTP-triggered shutdown reuses axum's graceful-shutdown path.
     pub shutdown: Arc<Notify>,
-    /// Bounds concurrently-held long-poll connections. A handler acquires a
-    /// permit for the duration it blocks; over `MAX_HELD_CONNECTIONS` the
-    /// permit is refused and the request 503s instead of pinning a slot.
-    pub held: Arc<Semaphore>,
+    /// Bounds concurrently-held `/wait-comment` long-polls. A handler acquires
+    /// a permit for the duration it blocks; over the ceiling the permit is
+    /// refused and the request 503s instead of pinning a slot.
+    pub held_comment_polls: Arc<Semaphore>,
+    /// The same, for `/wait`. Deliberately a distinct pool — see
+    /// `MAX_HELD_FINISH_WAITS`.
+    pub held_finish_waits: Arc<Semaphore>,
 }
 
 /// Slug-level "Claude is working on N comments" state. Lives only in memory
@@ -104,6 +127,13 @@ pub enum EventKind {
     /// `AppState::batch_processing`; this is just the wake signal for
     /// long-pollers and the comment-stream.
     BatchProcessingChanged,
+    /// Someone clicked Finish Review on this slug. Purely a wake signal: the
+    /// authoritative state is the persisted latch that `store::claim_finish`
+    /// consumes, so a `Finished` that nobody is subscribed for costs nothing.
+    /// This used to be a per-slug `broadcast::Sender<()>` in a map that was
+    /// never pruned — one `String` + channel leaked per slug ever published,
+    /// and `delete_blueprint` *created* entries for slugs it had just removed.
+    Finished,
 }
 
 impl AppState {
@@ -116,11 +146,11 @@ impl AppState {
         AppState {
             store,
             events: tx,
-            finish_signals: Arc::new(Mutex::new(HashMap::new())),
             batch_processing: Arc::new(Mutex::new(HashMap::new())),
             auth,
             shutdown: Arc::new(Notify::new()),
-            held: Arc::new(Semaphore::new(MAX_HELD_CONNECTIONS)),
+            held_comment_polls: Arc::new(Semaphore::new(MAX_HELD_COMMENT_POLLS)),
+            held_finish_waits: Arc::new(Semaphore::new(MAX_HELD_FINISH_WAITS)),
         }
     }
 
@@ -179,13 +209,6 @@ impl AppState {
         }
     }
 
-    pub async fn finish_sender(&self, slug: &str) -> broadcast::Sender<()> {
-        let mut m = self.finish_signals.lock().await;
-        m.entry(slug.to_string())
-            .or_insert_with(|| broadcast::channel(8).0)
-            .clone()
-    }
-
     /// Current persisted version of a blueprint (DB-authoritative). Returns 0
     /// for an unknown slug so callers can treat "missing" as version 0. The
     /// frontend polls this off the comments response to show the "Blueprint
@@ -211,12 +234,40 @@ pub fn router(state: AppState) -> Router {
         .with_name("ps_session")
         .with_expiry(Expiry::OnInactivity(Duration::days(7)));
 
+    // Every route is registered before any `.layer`, because a layer only wraps
+    // what precedes it in the chain. `/static/*path` used to be registered
+    // *after* `session_layer` — harmless for a handler that takes no `Session`,
+    // but adding a `Session` or `WriteIdentity` extractor to anything below
+    // that line compiled fine and then failed at runtime with a
+    // session-extract error. Merging three named groups makes the ordering hard
+    // to get wrong by accident.
+    asset_routes()
+        .merge(api_routes())
+        .merge(auth_routes())
+        .layer(session_layer)
+        // Applies to every route above: refuse a body over the cap with 413
+        // before any handler buffers it. GET routes carry no body, so this is
+        // a no-op for them and a hard ceiling for the write endpoints.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(state)
+}
+
+/// The embedded frontend: the two HTML entry points plus the static bundle.
+fn asset_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(root))
         .route("/b/:slug", get(reviewer_page))
+        .route("/static/*path", get(static_asset))
+}
+
+/// The JSON API the CLI, the MCP server, and the reviewer page all speak.
+fn api_routes() -> Router<AppState> {
+    Router::new()
         .route("/api/health", get(health))
-        .route("/api/blueprints", post(create_blueprint))
-        .route("/api/blueprints", get(list_blueprints))
+        .route(
+            "/api/blueprints",
+            get(list_blueprints).post(create_blueprint),
+        )
         .route("/api/shutdown-if-empty", post(shutdown_if_empty))
         .route(
             "/api/blueprints/:slug",
@@ -254,18 +305,17 @@ pub fn router(state: AppState) -> Router {
             "/api/blueprints/:slug/batch-processing",
             post(start_batch_processing).delete(end_batch_processing),
         )
-        // Auth surface
+}
+
+/// The GitHub OAuth handshake and the session-identity probe. Every handler
+/// here takes a `Session`, so these depend on the session layer applied by
+/// `router`.
+fn auth_routes() -> Router<AppState> {
+    Router::new()
         .route("/login", get(crate::auth::login))
         .route("/auth/github/callback", get(crate::auth::callback))
         .route("/logout", post(crate::auth::logout))
         .route("/api/me", get(crate::auth::me))
-        .layer(session_layer)
-        .route("/static/*path", get(static_asset))
-        // Applies to every route above: refuse a body over the cap with 413
-        // before any handler buffers it. GET routes carry no body, so this is
-        // a no-op for them and a hard ceiling for the write endpoints.
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
 }
 
 async fn root() -> Response {
@@ -495,12 +545,12 @@ async fn delete_blueprint(
     if !removed {
         return Err(AppError::NotFound);
     }
+    // `BlueprintDeleted` alone releases a parked `/wait`: it re-checks the
+    // latch, and `claim_finish` now reports `NotFound` for the gone slug.
     let _ = state.events.send(Event {
         slug: slug.clone(),
         kind: EventKind::BlueprintDeleted,
     });
-    let sender = state.finish_sender(&slug).await;
-    let _ = sender.send(());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -607,26 +657,19 @@ async fn create_comment(
     {
         return Err(AppError::BadRequest("parent comment not found".into()));
     }
-    let (author, author_user_id, author_avatar_url) = match &identity {
-        crate::auth::Identity::SessionUser(u) => {
-            (u.login.clone(), Some(u.id), u.avatar_url.clone())
-        }
-        _ => (sanitize_author(&input.author), None, None),
-    };
-    let role = crate::auth::role_for(&identity, &state);
-    let is_agent = crate::auth::is_agent(&identity);
+    let who = attribution_for(&state, &identity, &input.author);
     let id = slug::comment_id();
     let comment = state.store.add_comment(
         &slug,
         &id,
-        &author,
+        &who.author,
         &input.body,
         &input.selector,
         input.parent_id.as_deref(),
-        author_user_id,
-        author_avatar_url,
-        role,
-        is_agent,
+        who.author_user_id,
+        who.author_avatar_url,
+        who.role,
+        who.is_agent,
     )?;
     if let Some(pid) = &input.parent_id {
         state.note_reply_in_batch(&slug, pid).await;
@@ -636,6 +679,44 @@ async fn create_comment(
         kind: EventKind::CommentAdded(id),
     });
     Ok(Json(comment))
+}
+
+/// Everything a write stamps on a comment about *who wrote it*, resolved once
+/// from the request's identity.
+struct Attribution {
+    author: String,
+    author_user_id: Option<i64>,
+    author_avatar_url: Option<String>,
+    role: crate::store::AuthorRole,
+    is_agent: bool,
+}
+
+/// Resolve attribution for a write, given the client-supplied `author` as a
+/// fallback.
+///
+/// The session user wins over `client_author` unconditionally — that is the
+/// entire anti-impersonation property, and it was previously re-derived by hand
+/// at three call sites (`create_comment`, `create_reply`, and inside
+/// `create_comments_batch`'s map, where it had already started to drift). One
+/// place to read means one place to get it wrong.
+fn attribution_for(
+    state: &AppState,
+    identity: &crate::auth::Identity,
+    client_author: &str,
+) -> Attribution {
+    let (author, author_user_id, author_avatar_url) = match identity {
+        crate::auth::Identity::SessionUser(u) => {
+            (u.login.clone(), Some(u.id), u.avatar_url.clone())
+        }
+        _ => (sanitize_author(client_author), None, None),
+    };
+    Attribution {
+        author,
+        author_user_id,
+        author_avatar_url,
+        role: crate::auth::role_for(identity, state),
+        is_agent: crate::auth::is_agent(identity),
+    }
 }
 
 /// Normalize an unauthenticated author string. Empty / whitespace → `"anonymous"`
@@ -695,31 +776,24 @@ async fn create_comments_batch(
         }
     }
 
-    let (session_author, session_user_id, session_avatar) = match &identity {
-        crate::auth::Identity::SessionUser(u) => {
-            (Some(u.login.clone()), Some(u.id), u.avatar_url.clone())
-        }
-        _ => (None, None, None),
-    };
-    let role = crate::auth::role_for(&identity, &state);
-    let is_agent = crate::auth::is_agent(&identity);
-
+    // Per-draft rather than once for the batch: only the client-supplied
+    // `author` fallback differs between drafts, and resolving each through the
+    // same helper as the single-comment routes is what keeps the three paths
+    // from drifting apart again.
     let drafts: Vec<CommentDraft> = inputs
         .into_iter()
         .map(|input| {
-            let author = session_author
-                .clone()
-                .unwrap_or_else(|| sanitize_author(&input.author));
+            let who = attribution_for(&state, &identity, &input.author);
             CommentDraft {
                 id: slug::comment_id(),
-                author,
+                author: who.author,
                 body: input.body,
                 selector: input.selector,
                 parent_id: input.parent_id,
-                author_user_id: session_user_id,
-                author_avatar_url: session_avatar.clone(),
-                role,
-                is_agent,
+                author_user_id: who.author_user_id,
+                author_avatar_url: who.author_avatar_url,
+                role: who.role,
+                is_agent: who.is_agent,
             }
         })
         .collect();
@@ -761,26 +835,19 @@ async fn create_reply(
         .store
         .find_comment(&slug, &parent_id)?
         .ok_or(AppError::NotFound)?;
-    let (author, author_user_id, author_avatar_url) = match &identity {
-        crate::auth::Identity::SessionUser(u) => {
-            (u.login.clone(), Some(u.id), u.avatar_url.clone())
-        }
-        _ => (sanitize_author(&input.author), None, None),
-    };
-    let role = crate::auth::role_for(&identity, &state);
-    let is_agent = crate::auth::is_agent(&identity);
+    let who = attribution_for(&state, &identity, &input.author);
     let id = slug::comment_id();
     let comment = state.store.add_comment(
         &slug,
         &id,
-        &author,
+        &who.author,
         &input.body,
         &parent.selector,
         Some(&parent_id),
-        author_user_id,
-        author_avatar_url,
-        role,
-        is_agent,
+        who.author_user_id,
+        who.author_avatar_url,
+        who.role,
+        who.is_agent,
     )?;
     state.note_reply_in_batch(&slug, &parent_id).await;
     let _ = state.events.send(Event {
@@ -795,6 +862,14 @@ struct FinishResponse {
     finished_at: i64,
 }
 
+/// `/wait`'s reply. `None` means "no finish claimed before the poll timed out,
+/// reconnect" — distinct from `FinishResponse`, which only ever describes a
+/// click that definitely happened.
+#[derive(Serialize)]
+struct WaitFinishResponse {
+    finished_at: Option<i64>,
+}
+
 /// `POST /api/blueprints/:slug/finish` — the reviewer is done with this round.
 /// Persists the timestamp *first*, then wakes any parked `/wait`. The write is
 /// what makes this durable: the broadcast is only a wakeup nudge, and
@@ -806,8 +881,10 @@ async fn finish_review(
     Path(slug): Path<String>,
 ) -> Result<Json<FinishResponse>, AppError> {
     let finished_at = state.store.mark_finished(&slug)?;
-    let sender = state.finish_sender(&slug).await;
-    let _ = sender.send(());
+    let _ = state.events.send(Event {
+        slug: slug.clone(),
+        kind: EventKind::Finished,
+    });
     Ok(Json(FinishResponse { finished_at }))
 }
 
@@ -862,35 +939,76 @@ async fn set_resolved(
 ///
 /// Subscribes BEFORE the first claim attempt so a finish arriving between the
 /// claim and the park is caught by the subscription rather than dropped.
+///
+/// Bounded by `FINISH_WAIT_TIMEOUT` rather than parking forever, so a client
+/// that died without closing its socket eventually gives its permit back. The
+/// timeout answers `finished_at: null`, which `cli::watch` reconnects on.
 async fn wait_for_finish(
     State(state): State<AppState>,
     Path(slug): Path<String>,
-) -> Result<Json<FinishResponse>, AppError> {
-    let sender = state.finish_sender(&slug).await;
-    let mut rx = sender.subscribe();
+) -> Result<Json<WaitFinishResponse>, AppError> {
+    let mut rx = state.events.subscribe();
 
     // Fast path: a click is already waiting. Doubles as the existence check —
     // `claim_finish` is `Err(NotFound)` for an unknown slug.
     if let Some(finished_at) = state.store.claim_finish(&slug)? {
-        return Ok(Json(FinishResponse { finished_at }));
+        return Ok(Json(WaitFinishResponse {
+            finished_at: Some(finished_at),
+        }));
     }
 
     // Slow path: park until a finish is broadcast. Bound the connections held
     // here — acquired only on the slow path so fast-path claims never trip it.
     let _permit = state
-        .held
+        .held_finish_waits
         .clone()
         .try_acquire_owned()
         .map_err(|_| AppError::TooManyConnections)?;
+    let timeout = tokio::time::sleep(FINISH_WAIT_TIMEOUT);
+    tokio::pin!(timeout);
+
     loop {
-        if rx.recv().await.is_err() {
-            // Sender dropped (daemon shutting down) — nothing more will arrive.
-            return Err(AppError::NotFound);
-        }
-        // The broadcast is only a nudge; the latch is authoritative. If another
-        // waiter claimed this finish first, keep parking.
-        if let Some(finished_at) = state.store.claim_finish(&slug)? {
-            return Ok(Json(FinishResponse { finished_at }));
+        tokio::select! {
+            _ = &mut timeout => {
+                return Ok(Json(WaitFinishResponse { finished_at: None }));
+            }
+            ev = rx.recv() => {
+                match ev {
+                    Ok(event) if event.slug == slug => match event.kind {
+                        // The broadcast is only a nudge; the latch is
+                        // authoritative. If another waiter claimed this finish
+                        // first, keep parking.
+                        EventKind::Finished => {
+                            if let Some(finished_at) = state.store.claim_finish(&slug)? {
+                                return Ok(Json(WaitFinishResponse {
+                                    finished_at: Some(finished_at),
+                                }));
+                            }
+                        }
+                        // Nothing left to wait for — release rather than park
+                        // until the timeout on a slug that no longer exists.
+                        EventKind::BlueprintDeleted => return Err(AppError::NotFound),
+                        EventKind::CommentAdded(_)
+                        | EventKind::CommentBatchAdded(_)
+                        | EventKind::BlueprintUpdated
+                        | EventKind::BatchProcessingChanged => {}
+                    },
+                    Ok(_) => continue,
+                    // Lagging past the buffer can drop a `Finished`, so re-read
+                    // the latch instead of assuming nothing happened.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(finished_at) = state.store.claim_finish(&slug)? {
+                            return Ok(Json(WaitFinishResponse {
+                                finished_at: Some(finished_at),
+                            }));
+                        }
+                    }
+                    // Sender dropped (daemon shutting down) — nothing more will arrive.
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Ok(Json(WaitFinishResponse { finished_at: None }));
+                    }
+                }
+            }
         }
     }
 }
@@ -992,7 +1110,7 @@ async fn wait_for_comment(
     // another slot. Acquired only on the slow path so a burst of fast-path
     // reads (comments already present) never trips the limit.
     let _permit = state
-        .held
+        .held_comment_polls
         .clone()
         .try_acquire_owned()
         .map_err(|_| AppError::TooManyConnections)?;
@@ -1017,6 +1135,7 @@ async fn wait_for_comment(
                             EventKind::BlueprintDeleted => return Err(AppError::NotFound),
                             EventKind::BlueprintUpdated => {}
                             EventKind::BatchProcessingChanged => {}
+                            EventKind::Finished => {}
                         }
                     }
                     Ok(_) => continue,
