@@ -12,6 +12,7 @@ use axum::extract::Query as AxumQuery;
 use axum::response::Redirect;
 use axum::routing::{get, post};
 use blueprint::auth::AuthConfig;
+use blueprint::server::AppState;
 use blueprint::store::Store;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -28,6 +29,9 @@ pub const MOCK_LOGIN: &str = "mockuser";
 pub struct AuthedTest {
     pub daemon_base: String,
     pub cli_token: String,
+    /// The daemon's own state, so a test can observe server-side effects the
+    /// HTTP response doesn't carry — notably whether the shutdown notify fired.
+    pub state: AppState,
     pub _tmp: TempDir,
 }
 
@@ -83,10 +87,11 @@ pub async fn spawn_with_auth_owner(owner_login: Option<&str>) -> AuthedTest {
     let mock_base = spawn_mock_github().await;
     let (listener, daemon_base) = bind_listener().await;
     let auth = test_auth_config(&daemon_base, &mock_base, owner_login.map(str::to_string));
-    let (tmp, _state) = spawn_daemon_on(listener, Some(Arc::new(auth))).await;
+    let (tmp, state) = spawn_daemon_on(listener, Some(Arc::new(auth))).await;
     AuthedTest {
         daemon_base,
         cli_token: TEST_CLI_TOKEN.into(),
+        state,
         _tmp: tmp,
     }
 }

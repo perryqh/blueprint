@@ -407,7 +407,20 @@ async fn create_blueprint(
 /// decision can't read stale state. If a publish lands *after* we signal,
 /// axum's graceful shutdown still serves it before exiting, and the next
 /// CLI call respawns the daemon. See `unpublish` in `cli.rs`.
-async fn shutdown_if_empty(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+///
+/// Gated at `BlueprintWrite` because stopping the daemon is at least as
+/// privileged as deleting a blueprint — the writes that gate already refuses.
+/// The "only if empty" precondition is not a substitute for the gate:
+/// `GET /api/blueprints` is unauthenticated, so a caller can poll for the empty
+/// window and fire into it, and an empty daemon is exactly when this endpoint
+/// succeeds. `blueprint unpublish` is the only caller, and it sends the CLI
+/// bearer (see `cli_http_client` in `cli.rs`); legacy local-trust mode stays
+/// open because `require_identity_for_writes` short-circuits when no auth is
+/// configured.
+async fn shutdown_if_empty(
+    State(state): State<AppState>,
+    _write: crate::auth::BlueprintWrite,
+) -> Result<StatusCode, AppError> {
     let count = state.store.count_blueprints()?;
     if count == 0 {
         state.shutdown.notify_one();

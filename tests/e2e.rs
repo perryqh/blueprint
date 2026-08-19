@@ -1325,6 +1325,80 @@ async fn anonymous_blueprint_writes_are_rejected_when_auth_is_enabled() {
     assert_eq!(phantom.status(), 404);
 }
 
+/// `POST /api/shutdown-if-empty` was left ungated when the create/replace/delete
+/// gate landed, so an anonymous caller could stop the daemon outright.
+///
+/// The store must be **empty** for this to test anything: with a blueprint
+/// present the endpoint answers 409 for everyone, which would pass whether or
+/// not the gate exists. Empty is also the only state where the endpoint does
+/// something, and `GET /api/blueprints` is unauthenticated — so an attacker can
+/// watch for exactly this window.
+#[tokio::test]
+async fn anonymous_shutdown_is_refused_on_an_empty_authed_daemon() {
+    let s = spawn_with_auth().await;
+    let http = client();
+
+    // Subscribe before the request so we can prove the notify never fires — the
+    // status code alone can't distinguish "refused" from "refused, but shut down
+    // anyway".
+    let waiter = s.state.shutdown.clone();
+    let notified = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_millis(300), waiter.notified())
+            .await
+            .is_ok()
+    });
+
+    let r = http
+        .post(format!("{}/api/shutdown-if-empty", s.daemon_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "anonymous shutdown must be refused");
+
+    assert!(
+        !notified.await.unwrap(),
+        "a refused shutdown must not signal the daemon to exit"
+    );
+
+    // The refusal was a gate, not a crash: the daemon still answers.
+    let health = http
+        .get(format!("{}/api/health", s.daemon_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200, "daemon should still be serving");
+}
+
+/// The other half of the gate: `blueprint unpublish` sends the CLI bearer, so
+/// the legitimate caller must still be able to stop an empty daemon. Without
+/// this, gating the endpoint would strand a daemon running forever after the
+/// last blueprint is removed.
+#[tokio::test]
+async fn cli_bearer_can_still_stop_an_empty_authed_daemon() {
+    let s = spawn_with_auth().await;
+    let http = client();
+
+    let waiter = s.state.shutdown.clone();
+    let notified = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(2), waiter.notified())
+            .await
+            .is_ok()
+    });
+
+    let r = http
+        .post(format!("{}/api/shutdown-if-empty", s.daemon_base))
+        .bearer_auth(&s.cli_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204, "bearer shutdown of an empty daemon");
+
+    assert!(
+        notified.await.unwrap(),
+        "the shutdown notify must still fire for the CLI"
+    );
+}
+
 /// Legacy local-trust mode — no OAuth configured — must stay wide open, since
 /// that's the only way the CLI works before anyone sets up credentials.
 #[tokio::test]

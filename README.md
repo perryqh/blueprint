@@ -153,7 +153,9 @@ blueprint unpublish <slug>                       # daemon stops when no blueprin
 
 **Cache hygiene.** `/static/*` and `/api/blueprints/:slug/raw` set `Cache-Control: no-store` so a browser never serves stale frontend assets or stale blueprint HTML.
 
-**Roles and the write gate.** Every comment is server-stamped with a `role` (`owner` / `user` / `guest`) and an `is_agent` boolean derived from the request's identity at write time (see `src/auth.rs::role_for` and `::is_agent`). The Claude skill keys its triage off `c.role` — only `owner` comments trigger plan edits; everyone else gets a reply only. There is no 401 gate on anonymous writes: the daemon is localhost-only and provenance via the `role` tag is the defense. See Step 3 above for the env-var configuration.
+**Roles and the write gate.** Every comment is server-stamped with a `role` (`owner` / `user` / `guest`) and an `is_agent` boolean derived from the request's identity at write time (see `src/auth.rs::role_for` and `::is_agent`). The Claude skill keys its triage off `c.role` — only `owner` comments trigger plan edits; everyone else gets a reply only.
+
+Comments themselves have no 401 gate: anonymous ones land as `guest`, and provenance via the `role` tag is the defense — that's what makes drive-by review work. Destructive requests are gated, though. Once OAuth is configured, creating, replacing, or deleting a blueprint and `POST /api/shutdown-if-empty` all require a session or the CLI bearer, and answer 401 without one (`WriteKind::Blueprint` in `src/auth.rs`). With no OAuth configured the daemon stays in legacy local-trust mode and enforces nothing, since that's the only way the CLI works before credentials exist. See Step 3 above for the env-var configuration.
 
 **Batch-processing indicator.** When the skill wakes on a Submit-all batch, it calls `blueprint batch-processing start <slug> --parent <id>...` to light a slug-level "Claude is working on N comments" pill in the sidebar. The server tracks the batch's `pending_parents` and auto-clears the pill when the last reply lands — no explicit DELETE needed on the happy path. A 5-minute TTL evicts stale entries if the skill crashes mid-batch.
 
@@ -179,6 +181,8 @@ The CLI is a thin wrapper over a REST API at `http://127.0.0.1:7321`:
 | `GET`    | `/api/me`                                           | `{ id, login, name, avatar_url, is_owner }` or 401 — used by the chrome    |
 | `POST`   | `/api/blueprints/:slug/batch-processing`            | `{ "author": "Claude Code", "parent_ids": [...] }` — light the indicator   |
 | `DELETE` | `/api/blueprints/:slug/batch-processing`            | Clear the indicator. Mostly redundant — the server auto-clears on replies  |
+
+Once OAuth is configured, `POST`/`PUT`/`DELETE /api/blueprints` and `POST /api/shutdown-if-empty` require a session cookie or the CLI bearer and answer **401** without one. Everything else — including posting comments — is open. See **Roles and the write gate** above.
 
 Every `Comment` returned by the API includes `role` (`"owner" | "user" | "guest"`) and `is_agent` (boolean) alongside `author`, `body`, `selector`, etc. — both fields are server-stamped from the request's identity, not from anything the client sends. The comments-list response also includes an optional `batch_processing: { author, count, started_at }` while the agent is working on a Submit-all batch.
 
@@ -218,12 +222,15 @@ Stack: `axum`, `tokio`, `rusqlite` (bundled), `nix` (flock), `serde`, `clap`, `r
 ## Tests
 
 ```bash
-cargo test
+cargo test    # Rust: daemon, store, CLI, MCP
+npm test      # frontend ES modules, via vitest
 ```
 
-Covers: publish → comment → reply → finish → fetch → update → drift → unpublish; random-slug generation; empty-HTML / empty-body / unknown-parent rejection; the `GET /api/blueprints` summary shape; `wait-comment` fast-path and slow-path; OAuth round-trip against a mock GitHub; CLI bearer-token write-auth; multi-repo concurrency (`shutdown-if-empty`, `X-Client-Cwd`); the batch endpoint (atomicity, single wake-up); CLI subprocess smoke test; and a grep-based "no stale strings" check that proves the rename is complete.
+Rust covers: publish → comment → reply → finish → fetch → update → drift → unpublish; random-slug generation; empty-HTML / empty-body / unknown-parent rejection; the `GET /api/blueprints` summary shape; `wait-comment` fast-path and slow-path; OAuth round-trip against a mock GitHub; CLI bearer-token write-auth and the blueprint write gate in both directions; multi-repo concurrency (`shutdown-if-empty`, `X-Client-Cwd`); the batch endpoint (atomicity, single wake-up); schema migrations; and a CLI subprocess smoke test.
 
-Browser-side anchoring, collapse, and click-to-scroll are not covered by the test suite (manual verification only).
+JS covers the four frontend modules with real behaviour, not smoke tests: the anchoring algorithm (including the known-wrong first-`indexOf` fallback, quotes spanning inline markup, and a surrogate pair split by the context window), poll backoff and the disconnect banner, draft storage, and rendering.
+
+Not covered by either suite: click-to-scroll and collapse interactions in a live browser (manual verification only).
 
 A [`rusty-hook`](https://github.com/swellaby/rusty-hook) pre-commit hook is installed via the build script the first time you run `cargo test` (or `cargo test --no-run`). It runs:
 
