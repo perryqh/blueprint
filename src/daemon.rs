@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -17,46 +17,62 @@ pub struct LockInfo {
     pub started_at: u64,
 }
 
-pub fn home_dir() -> PathBuf {
-    dirs::home_dir().expect("could not locate home directory")
+/// A missing `$HOME` is a diagnosable environment problem, not a bug — and
+/// `auth.rs`/`cli.rs` already degrade gracefully rather than panic. Returning a
+/// `Result` keeps the whole file honest instead of unwinding with a backtrace.
+pub fn home_dir() -> Result<PathBuf> {
+    dirs::home_dir().context(
+        "could not locate a home directory — set $HOME so blueprint knows where ~/.blueprint lives",
+    )
 }
 
-pub fn data_dir() -> PathBuf {
-    home_dir().join(".blueprint")
+pub fn data_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".blueprint"))
 }
 
-pub fn lock_path() -> PathBuf {
-    data_dir().join("daemon.lock")
+pub fn lock_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("daemon.lock"))
 }
 
 /// flock(2)'d during the discover-or-spawn critical section in `ensure_running`
 /// so two simultaneous CLI invocations don't both spawn a daemon and have the
 /// second die on bind. Separate from `daemon.lock` (which is data — pid/port).
-pub fn spawn_lock_path() -> PathBuf {
-    data_dir().join("daemon.spawn.lock")
+pub fn spawn_lock_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("daemon.spawn.lock"))
 }
 
-pub fn db_path() -> PathBuf {
-    data_dir().join("blueprints.db")
+pub fn db_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("blueprints.db"))
 }
 
 pub fn read_lock() -> Option<LockInfo> {
-    let p = lock_path();
-    if !p.exists() {
-        return None;
-    }
-    let bytes = std::fs::read(&p).ok()?;
+    // No `exists()` pre-check: it's a TOCTOU with no upside, since the read
+    // that follows already reports a missing file as an error.
+    let bytes = std::fs::read(lock_path().ok()?).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Write the lock via temp-file + `rename`, because `fs::write` truncates before
+/// it writes: a reader landing in that window sees an empty file, parses `None`,
+/// concludes no daemon is running, and spawns a duplicate. `rename` within the
+/// same directory is atomic, so a reader sees either the old lock or the new one.
 pub fn write_lock(info: &LockInfo) -> Result<()> {
-    let p = lock_path();
+    let p = lock_path()?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(info)?;
-    std::fs::write(&p, bytes)?;
-    Ok(())
+    // PID in the temp name so two daemons racing to publish a lock don't
+    // clobber each other's half-written scratch file.
+    let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, &p) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e.into())
+        }
+    }
 }
 
 /// Remove the lock file ONLY if it still names `pid`. Avoids the race where
@@ -66,30 +82,44 @@ pub fn write_lock(info: &LockInfo) -> Result<()> {
 pub fn clear_lock_for_pid(pid: u32) {
     if let Some(existing) = read_lock()
         && existing.pid == pid
+        && let Ok(p) = lock_path()
     {
-        let _ = std::fs::remove_file(lock_path());
+        let _ = std::fs::remove_file(p);
     }
 }
 
+/// signal 0 is "check existence" on unix.
+///
+/// `EPERM` means the process exists but belongs to another user — reporting that
+/// as dead would let us clear a perfectly good daemon's lock and spawn a second
+/// one that then fails to bind. Only `ESRCH` (no such process) is really dead.
 pub fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
+    #[cfg(unix)]
+    {
+        let Some(pid) = to_pid(pid) else {
+            return false;
+        };
+        match nix::sys::signal::kill(pid, None) {
+            Ok(()) => true,
+            Err(nix::errno::Errno::EPERM) => true,
+            Err(_) => false,
+        }
     }
-    // signal 0 is "check existence" on unix
-    unsafe { libc_kill(pid as i32, 0) == 0 }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
+/// `LockInfo.pid` is a `u32` on the wire; `kill(2)` wants a `pid_t`. Reject 0
+/// (and anything that doesn't fit) rather than signalling a process group.
 #[cfg(unix)]
-unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
+fn to_pid(pid: u32) -> Option<nix::unistd::Pid> {
+    if pid == 0 {
+        return None;
     }
-    unsafe { kill(pid, sig) }
-}
-
-#[cfg(not(unix))]
-unsafe fn libc_kill(_pid: i32, _sig: i32) -> i32 {
-    -1
+    i32::try_from(pid).ok().map(nix::unistd::Pid::from_raw)
 }
 
 /// Look up a running daemon. If the lock file points at a live process, return its info.
@@ -103,12 +133,33 @@ pub fn discover_running() -> Option<LockInfo> {
     }
 }
 
-/// Probe `/api/health` on the recorded port. ~500ms timeout; returns true only
-/// if the daemon answered OK, so a stale lock file or stuck process can't pass.
+/// Health probes deserve one client, not one per probe: `reqwest::Client` is
+/// `Arc`-backed, so cloning shares the connection pool instead of rebuilding the
+/// whole TLS/pool stack for a 200-byte GET against loopback.
+fn probe_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(HEALTH_PROBE_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
+/// Generous on purpose. The cost of a false negative is wildly asymmetric: an
+/// unhealthy verdict leads straight into kill-and-respawn, so a daemon that was
+/// merely busy (a handful of 30s reviewer long-polls plus a SQLite write) gets
+/// murdered and every in-flight long-poll is dropped. Waiting 3s to be sure is
+/// cheap; killing a working daemon is not.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Probe `/api/health` on the recorded port. Returns true only if the daemon
+/// answered 2xx, so a stale lock file or a process wedged mid-boot can't pass.
 async fn is_healthy(info: &LockInfo) -> bool {
-    reqwest::Client::new()
+    probe_client()
         .get(format!("http://127.0.0.1:{}/api/health", info.port))
-        .timeout(Duration::from_millis(500))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -123,6 +174,8 @@ async fn is_healthy(info: &LockInfo) -> bool {
 /// Best-effort: if locking fails (NFS, libc weirdness), the guard contains
 /// `None` and the caller proceeds without serialization — same behavior as
 /// before this change, which is already self-healing via `wait_for_daemon`.
+/// That degradation is logged rather than silent, because "two daemons raced"
+/// is otherwise indistinguishable from a bind failure at the far end.
 pub struct SpawnLock {
     #[cfg(unix)]
     _flock: Option<nix::fcntl::Flock<std::fs::File>>,
@@ -132,15 +185,47 @@ fn acquire_spawn_lock() -> SpawnLock {
     #[cfg(unix)]
     {
         use nix::fcntl::{Flock, FlockArg};
-        let _ = std::fs::create_dir_all(data_dir());
-        let flock = std::fs::OpenOptions::new()
+        let Ok(dir) = data_dir() else {
+            tracing::warn!("no home directory; spawning without the spawn lock");
+            return SpawnLock { _flock: None };
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let Ok(path) = spawn_lock_path() else {
+            return SpawnLock { _flock: None };
+        };
+        let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(spawn_lock_path())
-            .ok()
-            .and_then(|f| Flock::lock(f, FlockArg::LockExclusive).ok());
+            .open(path)
+        else {
+            tracing::warn!("could not open the spawn lock file; spawning unserialized");
+            return SpawnLock { _flock: None };
+        };
+        // Non-blocking first so the common "peer is mid-spawn" case is visible
+        // in a log line, and so a wedged peer holding the lock forever can't
+        // hang us silently — `LockExclusive` alone would block with no
+        // diagnostic at all.
+        let flock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(f) => Some(f),
+            Err((file, nix::errno::Errno::EWOULDBLOCK)) => {
+                tracing::debug!(
+                    "another blueprint process is mid-spawn; waiting on the spawn lock"
+                );
+                match Flock::lock(file, FlockArg::LockExclusive) {
+                    Ok(f) => Some(f),
+                    Err((_, e)) => {
+                        tracing::warn!(%e, "blocking flock failed; spawning unserialized");
+                        None
+                    }
+                }
+            }
+            Err((_, e)) => {
+                tracing::warn!(%e, "could not flock the spawn lock; spawning unserialized");
+                None
+            }
+        };
         SpawnLock { _flock: flock }
     }
     #[cfg(not(unix))]
@@ -171,23 +256,105 @@ pub async fn ensure_running(exe: &Path) -> Result<LockInfo> {
         if is_healthy(&info).await {
             return Ok(info);
         }
-        // Lock points at a dead or stuck process. SIGTERM if it's still
-        // around, then clear the lock and spawn fresh.
-        if process_alive(info.pid) {
-            unsafe { libc_kill(info.pid as i32, 15) };
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        // Lock points at a dead or stuck process. Make sure it's actually gone
+        // before spawning: the replacement binds the same port, so a predecessor
+        // that outlives us fails the new daemon's bind instead.
+        terminate_and_reap(info.pid).await;
         clear_lock_for_pid(info.pid);
     }
 
     spawn_detached(exe)?;
-    wait_for_daemon(Duration::from_secs(5))
-        .await
-        .context("daemon did not come up within 5s")
+    wait_for_daemon(STARTUP_BUDGET).await.with_context(|| {
+        format!(
+            "daemon did not come up within {}s",
+            STARTUP_BUDGET.as_secs()
+        )
+    })
+}
+
+/// How long a doomed daemon gets to honor SIGTERM before we escalate. It may be
+/// draining reviewer long-polls, so give it room — but not forever.
+const TERM_GRACE: Duration = Duration::from_secs(3);
+
+/// How long after SIGKILL we wait for the PID to vanish. SIGKILL is not
+/// negotiable, so this only covers the kernel's teardown and the reap.
+const KILL_GRACE: Duration = Duration::from_secs(1);
+
+/// Startup budget for a freshly spawned daemon. Sized to sit above the
+/// worst-case kill path (TERM_GRACE + KILL_GRACE) plus a real boot — otherwise a
+/// slow-but-successful shutdown eats the whole budget and `ensure_running` fails
+/// on a daemon that was seconds from ready.
+const STARTUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// SIGTERM, then poll for the PID to actually disappear, escalating to SIGKILL
+/// if it outlives `TERM_GRACE`.
+///
+/// The reap matters as much as the signal. When the daemon is our own previously
+/// spawned child, `Command::spawn` never waited on it, so SIGTERM turns it into
+/// a zombie — and a zombie still answers `kill(pid, 0)`, so `process_alive`
+/// would report it alive forever and we'd loop here on every invocation.
+/// `waitpid(WNOHANG)` on each pass collects it if it is ours, and is a harmless
+/// `ECHILD` if it isn't.
+async fn terminate_and_reap(pid: u32) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{self, Signal};
+        let Some(target) = to_pid(pid) else { return };
+        if !process_alive(pid) {
+            reap(target);
+            return;
+        }
+        let _ = signal::kill(target, Signal::SIGTERM);
+        if wait_for_exit(pid, target, TERM_GRACE).await {
+            return;
+        }
+        tracing::warn!(
+            pid,
+            "daemon ignored SIGTERM for {}s; escalating to SIGKILL so the port is released",
+            TERM_GRACE.as_secs()
+        );
+        let _ = signal::kill(target, Signal::SIGKILL);
+        if !wait_for_exit(pid, target, KILL_GRACE).await {
+            // Nothing left to try; the bind error from the fresh child will be
+            // the user-visible symptom, so say why here.
+            tracing::warn!(
+                pid,
+                "daemon survived SIGKILL; the replacement may fail to bind"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Poll until `pid` is gone or `budget` elapses, reaping on every pass.
+#[cfg(unix)]
+async fn wait_for_exit(pid: u32, target: nix::unistd::Pid, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        reap(target);
+        if !process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Non-blocking reap. `ECHILD` (not our child) and `Ok(StillAlive)` are both
+/// expected and uninteresting.
+#[cfg(unix)]
+fn reap(target: nix::unistd::Pid) {
+    use nix::sys::wait::{WaitPidFlag, waitpid};
+    let _ = waitpid(target, Some(WaitPidFlag::WNOHANG));
 }
 
 fn spawn_detached(exe: &Path) -> Result<()> {
-    let log_path = data_dir().join("daemon.log");
+    let log_path = data_dir()?.join("daemon.log");
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -206,14 +373,17 @@ fn spawn_detached(exe: &Path) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: pre_exec runs in the child between fork() and exec(). setsid()
-        // detaches from the controlling terminal so the daemon survives the parent's exit.
+        // detaches from the controlling terminal so the daemon survives the
+        // parent's exit. It is async-signal-safe and allocates nothing, which is
+        // what makes it legal in this window.
         unsafe {
             cmd.pre_exec(|| {
-                unsafe extern "C" {
-                    fn setsid() -> i32;
+                // EPERM here means we're already a session leader — which is
+                // exactly the state we wanted, so it isn't a spawn failure.
+                match nix::unistd::setsid() {
+                    Ok(_) | Err(nix::errno::Errno::EPERM) => Ok(()),
+                    Err(e) => Err(std::io::Error::from(e)),
                 }
-                setsid();
-                Ok(())
             });
         }
     }
@@ -221,16 +391,15 @@ fn spawn_detached(exe: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Wait for a spawned daemon to become *usable*, not merely reachable.
+/// `is_healthy` checks for 2xx; the earlier `.is_ok()` here accepted any reply,
+/// so a daemon that bound the port and then failed to open SQLite counted as a
+/// successful start and the caller got a lock pointing at a 500 machine.
 async fn wait_for_daemon(timeout: Duration) -> Result<LockInfo> {
     let started = Instant::now();
     loop {
         if let Some(info) = discover_running()
-            && reqwest::Client::new()
-                .get(format!("http://127.0.0.1:{}/api/health", info.port))
-                .timeout(Duration::from_millis(500))
-                .send()
-                .await
-                .is_ok()
+            && is_healthy(&info).await
         {
             return Ok(info);
         }
@@ -242,9 +411,9 @@ async fn wait_for_daemon(timeout: Duration) -> Result<LockInfo> {
 }
 
 /// Run the daemon in this process — blocks forever.
-pub async fn run_foreground(preferred_port: Option<u16>) -> Result<()> {
-    let store = Arc::new(Store::open(&db_path()).context("opening sqlite store")?);
-    let auth_cfg = crate::auth::AuthConfig::from_env();
+pub async fn run_foreground(preferred_port: Option<u16>, env: crate::auth::EnvFile) -> Result<()> {
+    let store = Arc::new(Store::open(db_path()?).context("opening sqlite store")?);
+    let auth_cfg = crate::auth::AuthConfig::from_env_file(&env);
 
     // Surface the two role-config misconfigurations loudly. Either branch
     // means owner-role assignment is silently broken; an early stderr line

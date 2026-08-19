@@ -6,8 +6,18 @@ description = "Share interactive HTML blueprints with inline anchored comments"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }
+# Named rather than "full": these are the features actually reachable from the
+# code, so the list doubles as documentation of what the daemon uses.
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-std",
+  "io-util",
+  "time",
+  "sync",
+  "signal",
+] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,20 +27,26 @@ anyhow = "1"
 thiserror = "1"
 dirs = "5"
 mime_guess = "2"
-reqwest = { version = "0.12", features = ["json", "blocking", "cookies"] }
+reqwest = { version = "0.12", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
-oauth2 = "4"
+oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
 tower-sessions = "0.13"
-tower = "0.5"
 async-trait = "0.1"
-url = "2"
-nix = { version = "0.29", features = ["fs"] }
+# `signal` + `process` for the daemon's SIGTERM/reap path, replacing a
+# hand-declared `extern "C" { fn kill }`.
+nix = { version = "0.29", features = ["fs", "signal", "process"] }
+# Non-poisoning mutex. A panic mid-query leaves the SQLite Connection perfectly
+# usable, so std's poison flag turns a recoverable blip into a permanently
+# bricked daemon — and its `lock()` returns a Result nobody can act on.
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
 rusty-hook = "0.11"
+# Only the integration tests drive a browser-shaped client with a cookie jar.
+reqwest = { version = "0.12", features = ["json", "cookies"] }
 
 [profile.release]
 lto = "thin"

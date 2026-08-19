@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{client, spawn};
+use common::{client, spawn, wait_for_parked_pollers};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -56,43 +56,83 @@ async fn finish_clicked_with_no_waiter_is_claimed_by_a_later_wait() {
     );
 }
 
-/// One click must wake exactly one of several parked waiters. The others keep
-/// waiting — a single finish is not a broadcast to every listener.
+/// One click must be claimed by exactly one of several parked waiters. The
+/// others get nothing — a single finish is not a broadcast to every listener.
+///
+/// "Nothing" means *still parked*, not "answered with null". A waiter that loses
+/// the race keeps waiting for the *next* click, which is the whole point of a
+/// durable latch: two `blueprint watch` processes on one slug shouldn't both end
+/// their round on one reviewer click. `FINISH_WAIT_TIMEOUT` is an hour-long
+/// safety valve for dead clients, not a "nothing yet" reply — so a loser is only
+/// observable here as a client that gave up first.
+///
+/// Both halves of that are asserted, because each alone is satisfiable by a bug:
+/// counting claims alone would pass if every waiter claimed and two happened to
+/// error for unrelated reasons, and checking for timeouts alone would pass if
+/// nobody claimed at all.
 #[tokio::test]
 async fn one_finish_is_claimed_by_exactly_one_of_several_parked_waiters() {
     let s = spawn().await;
     let http = client();
     publish(&http, &s.base, "p").await;
 
-    // Park three waiters, each with a timeout well short of the test's patience
-    // so the losers report a timeout rather than hanging the suite.
+    let sem = s.state.held_finish_waits.clone();
     let waiters: Vec<_> = (0..3)
         .map(|_| {
             let base = s.base.clone();
             tokio::spawn(async move {
-                reqwest::Client::new()
+                let r = reqwest::Client::new()
                     .get(format!("{base}/api/blueprints/p/wait"))
-                    .timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_millis(600))
                     .send()
-                    .await
-                    .map(|r| r.status().as_u16())
+                    .await;
+                match r {
+                    Ok(resp) => {
+                        assert_eq!(resp.status(), 200);
+                        Ok(resp.json::<Value>().await.unwrap()["finished_at"].as_i64())
+                    }
+                    // Carry whether it was a timeout so the caller can tell
+                    // "still parked" from "the server broke".
+                    Err(e) => Err(e.is_timeout()),
+                }
             })
         })
         .collect();
 
-    // Let all three reach the slow path before the single click lands.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    finish(&http, &s.base, "p").await;
+    // All three must reach the slow path before the single click lands —
+    // otherwise a straggler claims the latch on its fast path and the "exactly
+    // one" count is measuring the wrong thing. A parked `/wait` holds a permit
+    // for as long as it's parked, so waiting on the permit count observes the
+    // condition instead of guessing at it.
+    wait_for_parked_pollers(&sem, 3).await;
+    let finished_at = finish(&http, &s.base, "p").await;
 
-    let mut claimed = 0;
+    let mut claims = Vec::new();
+    let mut still_parked = 0;
     for w in waiters {
-        if let Ok(Ok(200)) = w.await {
-            claimed += 1;
+        match w.await.unwrap() {
+            Ok(Some(ts)) => claims.push(ts),
+            Ok(None) => panic!(
+                "a waiter answered `finished_at: null` before the hour-long safety \
+                 valve — a loser must keep waiting for the next click, not report \
+                 the round over"
+            ),
+            Err(true) => still_parked += 1,
+            Err(false) => {
+                panic!("a parked /wait failed for a reason other than the client timeout")
+            }
         }
     }
+
     assert_eq!(
-        claimed, 1,
-        "exactly one waiter should claim a single finish, got {claimed}"
+        claims,
+        vec![finished_at],
+        "exactly one waiter must claim the finish, and it must report the \
+         timestamp the click wrote"
+    );
+    assert_eq!(
+        still_parked, 2,
+        "the two losers must remain parked, waiting for the next click"
     );
 }
 
@@ -114,15 +154,22 @@ async fn a_claimed_finish_does_not_resolve_the_next_round() {
         .expect("first wait claims the finish");
     assert_eq!(r.status(), 200);
 
-    // Second wait has nothing to claim and must park. Timing out is the pass.
+    // Second wait has nothing to claim and must park.
+    //
+    // Parking can only be observed as "the client gave up first", so the
+    // assertion has to be specifically that — a timeout. Asserting bare
+    // `is_err()` would also pass if the server panicked, refused the
+    // connection, or reset the socket, which is the opposite of what this test
+    // exists to prove.
     let second = http
         .get(format!("{}/api/blueprints/p/wait", s.base))
         .timeout(Duration::from_millis(300))
         .send()
         .await;
+    let err = second.expect_err("an already-claimed finish must not resolve a later wait");
     assert!(
-        second.is_err(),
-        "an already-claimed finish must not resolve a later wait"
+        err.is_timeout(),
+        "expected the wait to park until the client timed out, but it failed for another reason: {err}"
     );
 
     // Clicking again re-raises the latch, so a new round can end.
@@ -214,6 +261,7 @@ async fn deleting_a_blueprint_releases_a_parked_waiter() {
     let http = client();
     publish(&http, &s.base, "p").await;
 
+    let sem = s.state.held_finish_waits.clone();
     let base = s.base.clone();
     let waiter = tokio::spawn(async move {
         reqwest::Client::new()
@@ -223,7 +271,9 @@ async fn deleting_a_blueprint_releases_a_parked_waiter() {
             .await
             .map(|r| r.status().as_u16())
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The delete has to land while the waiter is genuinely parked; if it fires
+    // first the waiter 404s on its fast path and never tests the release.
+    wait_for_parked_pollers(&sem, 1).await;
 
     let r = http
         .delete(format!("{}/api/blueprints/p", s.base))

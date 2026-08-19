@@ -30,7 +30,12 @@
       </details>
     </div>
     <div class="right">
-      <input id="author" placeholder="your name" autocomplete="name">
+      <div id="author-field">
+        <!-- Real label rather than placeholder-as-label: the placeholder
+             disappears on input and is skipped by some screen readers. -->
+        <label class="visually-hidden" for="author">Your name</label>
+        <input id="author" placeholder="your name" autocomplete="name">
+      </div>
       <div id="auth-chip" class="auth-chip" hidden></div>
       <div class="theme-toggle" role="radiogroup" aria-label="Theme">
         <button type="button" data-theme-value="system" aria-checked="true" aria-label="System theme">Sys</button>
@@ -104,6 +109,6 @@
     </div>
   </dialog>
 
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>
