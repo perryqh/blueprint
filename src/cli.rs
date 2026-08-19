@@ -158,9 +158,9 @@ pub enum BatchProcessingCmd {
     End { slug: String },
 }
 
-pub async fn run(cli: Cli) -> Result<()> {
+pub async fn run(cli: Cli, env: crate::auth::EnvFile) -> Result<()> {
     match cli.command {
-        Cmd::Serve { port } => daemon::run_foreground(port).await,
+        Cmd::Serve { port } => daemon::run_foreground(port, env).await,
         Cmd::Status => status().await,
         Cmd::Publish {
             file,

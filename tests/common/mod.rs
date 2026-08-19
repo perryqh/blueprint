@@ -21,7 +21,7 @@ pub async fn spawn() -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let base = format!("http://{}", listener.local_addr().unwrap());
     let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(Store::open(&tmp.path().join("blueprints.db")).expect("store"));
+    let store = Arc::new(Store::open(tmp.path().join("blueprints.db")).expect("store"));
     let app = router(AppState::with_auth(store, None));
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;

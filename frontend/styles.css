@@ -637,6 +637,16 @@ iframe#blueprint-frame {
   padding: var(--space-3) var(--space-5);
   scroll-behavior: smooth;
 }
+/* j/k navigation focuses the group element itself so screen readers announce
+   the thread; the ring is the only visible cue that it moved. */
+.comments .group:focus-visible {
+  outline: 2px solid var(--color-info-fg);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comments { scroll-behavior: auto; }
+}
 
 /* Skeleton groups while loading */
 .comments-loading {
@@ -711,7 +721,9 @@ iframe#blueprint-frame {
   font-weight: var(--weight-semibold);
 }
 
-/* Quote bar */
+/* Quote bar. The bar itself is a flex container; the collapse affordance is a
+   real <button> (.quote-toggle) filling it, with `resolve` as a sibling button
+   — interactive content can't nest, so they can't be one element. */
 .comments .quote {
   background: var(--color-quote-bg);
   border-left: 3px solid var(--color-quote-border);
@@ -721,9 +733,31 @@ iframe#blueprint-frame {
   margin: 0 0 var(--space-2);
   color: var(--color-quote-fg);
   word-break: break-word;
-  cursor: pointer;
   position: relative;
   user-select: none;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+}
+.comments .quote .quote-toggle {
+  flex: 1;
+  min-width: 0;
+  /* Strip the UA button chrome — this element is styled entirely by .quote. */
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  word-break: break-word;
+}
+.comments .quote .quote-toggle:focus-visible {
+  outline: 2px solid var(--color-info-fg);
+  outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
 .comments .quote::before {
@@ -981,7 +1015,8 @@ iframe#blueprint-frame {
   30%           { transform: translateY(-3px); opacity: 1; }
 }
 
-/* Resolve link + tag */
+/* Resolve link + tag. A <button>, not an <a href="#"> — it performs an action
+   rather than navigating, so it needs button semantics for screen readers. */
 .resolve-link {
   font-size: var(--text-xs);
   padding: 1px var(--space-2);
@@ -995,6 +1030,12 @@ iframe#blueprint-frame {
   font-family: var(--font-mono);
   vertical-align: 1px;
   transition: background var(--motion-fast), color var(--motion-fast);
+  appearance: none;
+  cursor: pointer;
+  flex: none;
+  align-self: center;
+  white-space: nowrap;
+  line-height: 1.6;
 }
 .resolve-link:hover {
   background: var(--color-success-fg);

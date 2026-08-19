@@ -1,0 +1,14 @@
+{
+  "name": "blueprint-frontend-tests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Test-only package. The frontend itself ships as native ES modules with no build step; this exists solely so vitest+jsdom can exercise frontend/*.js.",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1",
+    "vitest": "^2.1.8"
+  }
+}

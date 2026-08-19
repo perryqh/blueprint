@@ -145,7 +145,7 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, SqliteSessionStore) {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(&tmp.path().join("t.db")).unwrap());
+        let store = Arc::new(Store::open(tmp.path().join("t.db")).unwrap());
         (tmp, SqliteSessionStore::new(store))
     }
 

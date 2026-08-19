@@ -1,4 +1,5 @@
 use anyhow::Result;
+use blueprint::auth::EnvFile;
 use blueprint::cli;
 use clap::Parser;
 
@@ -11,10 +12,11 @@ async fn main() -> Result<()> {
         )
         .try_init();
 
-    // Pulls ~/.blueprint/env into the process environment (GitHub OAuth creds,
-    // OAUTH_CALLBACK_URL, BLUEPRINT_PORT). Missing file = auth disabled.
-    blueprint::auth::load_env_file()?;
+    // Parsed and passed down explicitly rather than installed into the process
+    // environment. `set_var` would race this runtime's worker threads, which
+    // `#[tokio::main]` has already spawned by the time we get here.
+    let env = EnvFile::load()?;
 
     let args = cli::Cli::parse();
-    cli::run(args).await
+    cli::run(args, env).await
 }

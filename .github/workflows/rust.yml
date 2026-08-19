@@ -27,3 +27,18 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  # The anchoring algorithm lives in JavaScript, so it needs its own runner.
+  # Split from the Rust job so a JS failure is legible at a glance.
+  frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Install
+      run: npm ci
+    - name: Test
+      run: npx vitest run

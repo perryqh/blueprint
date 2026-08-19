@@ -27,7 +27,7 @@ async fn spawn() -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&tmp.path().join("blueprints.db")).unwrap());
+    let store = Arc::new(Store::open(tmp.path().join("blueprints.db")).unwrap());
     let state = AppState::with_auth(store, None);
     let shutdown = state.shutdown.clone();
     let app = router(state);

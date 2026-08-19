@@ -29,7 +29,7 @@ async fn spawn_daemon_on(
     auth: Option<Arc<blueprint::auth::AuthConfig>>,
 ) -> TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(Store::open(&tmp.path().join("blueprints.db")).expect("open store"));
+    let store = Arc::new(Store::open(tmp.path().join("blueprints.db")).expect("open store"));
     let state = AppState::with_auth(store, auth);
     let app = router(state);
     tokio::spawn(async move {
@@ -936,7 +936,7 @@ async fn spawn_auth_daemon_with_store(store: Arc<Store>, mock_base: &str) -> Str
 async fn spawn_with_auth() -> AuthedTest {
     let mock_base = spawn_mock_github().await;
     let tmp = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(Store::open(&tmp.path().join("blueprints.db")).expect("open store"));
+    let store = Arc::new(Store::open(tmp.path().join("blueprints.db")).expect("open store"));
     let daemon_base = spawn_auth_daemon_with_store(store, &mock_base).await;
 
     AuthedTest {
@@ -1275,15 +1275,18 @@ async fn callback_without_a_login_offers_a_retry() {
 }
 
 #[tokio::test]
-async fn write_without_auth_succeeds_and_tags_comment_as_guest() {
-    // Phase 0: localhost-only, no impersonation defense. Anonymous browser
-    // writes go through; the per-comment `role` tag makes provenance visible.
+async fn anonymous_comment_succeeds_and_is_tagged_as_guest() {
+    // Anonymous *commenting* stays open by design — that's what the `guest` role
+    // exists to tag, and the agent decides what to do with it from `role`.
+    // Publishing is a different matter: see
+    // `anonymous_blueprint_writes_are_rejected_when_auth_is_enabled`.
     let s = spawn_with_auth().await;
     let http = client();
 
-    // Publish works without auth.
+    // Publish as the agent would, over the CLI bearer.
     let r = http
         .post(format!("{}/api/blueprints", s.daemon_base))
+        .bearer_auth(&s.cli_token)
         .json(&json!({ "html": "<p>x</p>", "slug": "anon-pub" }))
         .send()
         .await
@@ -1312,11 +1315,103 @@ async fn write_without_auth_succeeds_and_tags_comment_as_guest() {
     assert_eq!(c["author"], "drive-by");
 }
 
+/// `require_identity_for_writes` used to be an unconditional `Ok(())` while the
+/// `WriteIdentity` extractor's doc comment promised it enforced something — so
+/// with OAuth fully configured, anyone who could reach the port could delete a
+/// blueprint. Comments stay open; destroying a plan does not.
+#[tokio::test]
+async fn anonymous_blueprint_writes_are_rejected_when_auth_is_enabled() {
+    let s = spawn_with_auth().await;
+    let http = client();
+
+    // Seed one blueprint over the bearer so there's something to try to destroy.
+    let r = http
+        .post(format!("{}/api/blueprints", s.daemon_base))
+        .bearer_auth(&s.cli_token)
+        .json(&json!({ "html": "<p>x</p>", "slug": "gated" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "bearer publish should still work");
+
+    // Create, replace, delete — all anonymous, all refused.
+    let created = http
+        .post(format!("{}/api/blueprints", s.daemon_base))
+        .json(&json!({ "html": "<p>y</p>", "slug": "should-not-exist" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 401, "anonymous create must be refused");
+
+    let replaced = http
+        .put(format!("{}/api/blueprints/gated", s.daemon_base))
+        .json(&json!({ "html": "<p>hijacked</p>" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), 401, "anonymous replace must be refused");
+
+    let deleted = http
+        .delete(format!("{}/api/blueprints/gated", s.daemon_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 401, "anonymous delete must be refused");
+
+    // And the refusals were real: the blueprint is untouched and the phantom
+    // slug was never created.
+    let raw = http
+        .get(format!("{}/api/blueprints/gated/raw", s.daemon_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), 200, "gated blueprint should survive");
+    assert_eq!(
+        raw.text().await.unwrap(),
+        "<p>x</p>",
+        "content was modified"
+    );
+
+    let phantom = http
+        .get(format!(
+            "{}/api/blueprints/should-not-exist/raw",
+            s.daemon_base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(phantom.status(), 404);
+}
+
+/// Legacy local-trust mode — no OAuth configured — must stay wide open, since
+/// that's the only way the CLI works before anyone sets up credentials.
+#[tokio::test]
+async fn anonymous_blueprint_writes_still_work_in_legacy_mode() {
+    let s = spawn().await;
+    let http = client();
+
+    let created = http
+        .post(format!("{}/api/blueprints", s.base))
+        .json(&json!({ "html": "<p>x</p>", "slug": "legacy-open" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+
+    let deleted = http
+        .delete(format!("{}/api/blueprints/legacy-open", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204);
+}
+
 #[tokio::test]
 async fn anonymous_empty_author_defaults_to_anonymous_server_side() {
     let s = spawn_with_auth().await;
     let http = client();
     http.post(format!("{}/api/blueprints", s.daemon_base))
+        .bearer_auth(&s.cli_token)
         .json(&json!({ "html": "<p>x</p>", "slug": "empty-author" }))
         .send()
         .await
@@ -1736,7 +1831,7 @@ async fn batch_processing_ttl_evicts_stale_entries() {
     let (listener, base) = bind_listener().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(
-        blueprint::store::Store::open(&tmp.path().join("blueprints.db")).expect("open store"),
+        blueprint::store::Store::open(tmp.path().join("blueprints.db")).expect("open store"),
     );
     let state = blueprint::server::AppState::with_auth(store.clone(), None);
     let app = blueprint::server::router(state.clone());

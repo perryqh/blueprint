@@ -242,9 +242,9 @@ async fn wait_for_daemon(timeout: Duration) -> Result<LockInfo> {
 }
 
 /// Run the daemon in this process — blocks forever.
-pub async fn run_foreground(preferred_port: Option<u16>) -> Result<()> {
-    let store = Arc::new(Store::open(&db_path()).context("opening sqlite store")?);
-    let auth_cfg = crate::auth::AuthConfig::from_env();
+pub async fn run_foreground(preferred_port: Option<u16>, env: crate::auth::EnvFile) -> Result<()> {
+    let store = Arc::new(Store::open(db_path()).context("opening sqlite store")?);
+    let auth_cfg = crate::auth::AuthConfig::from_env_file(&env);
 
     // Surface the two role-config misconfigurations loudly. Either branch
     // means owner-role assignment is silently broken; an early stderr line

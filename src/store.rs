@@ -1,9 +1,9 @@
 use crate::error::AppError;
 use crate::selector::TextQuoteSelector;
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,13 +52,31 @@ impl AuthorRole {
             AuthorRole::Guest => "guest",
         }
     }
+}
 
-    fn from_str(s: &str) -> Self {
-        match s {
-            "owner" => AuthorRole::Owner,
-            "user" => AuthorRole::User,
-            _ => AuthorRole::Guest,
+/// Read/write the role as SQLite text, so call sites say `r.get(n)?` and
+/// `params![role]` instead of hand-marshalling through `&str` at four places.
+///
+/// The unknown-value arm is a `warn!` rather than silence: this column decides
+/// whether a comment trips a plan edit, so a value we don't recognise is
+/// *reducing privilege*, and doing that invisibly is how you lose an afternoon.
+impl rusqlite::types::FromSql for AuthorRole {
+    fn column_result(v: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match v.as_str()? {
+            "owner" => Ok(AuthorRole::Owner),
+            "user" => Ok(AuthorRole::User),
+            "guest" => Ok(AuthorRole::Guest),
+            other => {
+                tracing::warn!(role = other, "unknown author role in database; using guest");
+                Ok(AuthorRole::Guest)
+            }
         }
+    }
+}
+
+impl rusqlite::ToSql for AuthorRole {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
     }
 }
 
@@ -122,11 +140,17 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Self, AppError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {
+        let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // rusqlite's default busy timeout is zero, so a SQLITE_BUSY fails on the
+        // spot instead of waiting. The WAL sidecars are shared across processes
+        // and the daemon respawns routinely, so two daemons overlapping during a
+        // restart is expected — give the loser a chance to wait rather than 500.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Owner-only, before WAL exists. A tower-sessions id is a bearer
         // credential — there's no signing and no server-side secret, so
         // whoever can read a session row can impersonate that user. The
@@ -319,7 +343,7 @@ impl Store {
         avatar_url: Option<&str>,
     ) -> Result<i64, AppError> {
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO users (github_id, login, name, avatar_url, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -339,7 +363,7 @@ impl Store {
     }
 
     pub fn get_user(&self, id: i64) -> Result<Option<User>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT id, github_id, login, name, avatar_url FROM users WHERE id = ?1",
@@ -373,7 +397,7 @@ impl Store {
         record: &str,
         expires_at: i64,
     ) -> Result<bool, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let rows = conn.execute(
             "INSERT OR IGNORE INTO sessions (id, record, expires_at) VALUES (?1, ?2, ?3)",
             params![id, record, expires_at],
@@ -384,7 +408,7 @@ impl Store {
     /// Write a session, creating it if absent. Used for updates to a session
     /// that already exists (a fresh one goes through `insert_session`).
     pub fn save_session(&self, id: &str, record: &str, expires_at: i64) -> Result<(), AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sessions (id, record, expires_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
@@ -397,7 +421,7 @@ impl Store {
 
     /// Load a session's serialized record, treating an expired row as absent.
     pub fn load_session(&self, id: &str) -> Result<Option<String>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT record FROM sessions WHERE id = ?1 AND expires_at > ?2",
@@ -409,7 +433,7 @@ impl Store {
     }
 
     pub fn delete_session(&self, id: &str) -> Result<(), AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -418,7 +442,7 @@ impl Store {
     /// expired rows are already invisible to `load_session`, so this is only
     /// housekeeping to keep the table from growing without bound.
     pub fn delete_expired_sessions(&self) -> Result<usize, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let rows = conn.execute(
             "DELETE FROM sessions WHERE expires_at <= ?1",
             params![now_ms()],
@@ -434,7 +458,7 @@ impl Store {
         client_cwd: Option<&str>,
     ) -> Result<Blueprint, AppError> {
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO blueprints (slug, html, created_at, delete_token, client_cwd) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -453,7 +477,7 @@ impl Store {
     /// duration of the read, so any concurrent `insert_blueprint` serializes
     /// against it.
     pub fn count_blueprints(&self) -> Result<i64, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM blueprints", [], |r| r.get(0))?;
         Ok(n)
     }
@@ -465,7 +489,7 @@ impl Store {
     /// changed. Comments authored against the archived version keep resolving
     /// against the exact text they anchored to via `get_blueprint_html_at`.
     pub fn update_blueprint_html(&self, slug: &str, html: &[u8]) -> Result<u64, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         // Snapshot the CURRENT html at its CURRENT version into the archive.
         // No-op INSERT if the slug doesn't exist (the UPDATE below reports it).
@@ -493,7 +517,7 @@ impl Store {
 
     /// Current live version of a blueprint, or `None` if the slug is unknown.
     pub fn get_blueprint_version(&self, slug: &str) -> Result<Option<u64>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let v = conn
             .query_row(
                 "SELECT version FROM blueprints WHERE slug = ?1",
@@ -510,7 +534,7 @@ impl Store {
     /// keeps going after finishing can end a later round too.
     pub fn mark_finished(&self, slug: &str) -> Result<i64, AppError> {
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let rows = conn.execute(
             "UPDATE blueprints SET finished_at = ?1, finish_pending = 1 WHERE slug = ?2",
             params![now, slug],
@@ -529,7 +553,7 @@ impl Store {
     /// waiters parked on one slug exactly one of them claims the finish, and a
     /// later review round sees a lowered latch and parks correctly.
     pub fn claim_finish(&self, slug: &str) -> Result<Option<i64>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let claimed = conn.execute(
             "UPDATE blueprints SET finish_pending = 0 WHERE slug = ?1 AND finish_pending = 1",
             params![slug],
@@ -566,7 +590,7 @@ impl Store {
     /// claimed it. `Ok(None)` means never finished; `Err(NotFound)` means the
     /// slug doesn't exist. Drives the reviewer header's durable finished state.
     pub fn finished_at(&self, slug: &str) -> Result<Option<i64>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT finished_at FROM blueprints WHERE slug = ?1",
             params![slug],
@@ -580,7 +604,7 @@ impl Store {
     /// ascending. `Err(NotFound)` for an unknown slug. Backs the reviewer's
     /// version dropdown.
     pub fn list_versions(&self, slug: &str) -> Result<(u64, Vec<u64>), AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         // One query: the archive holds every superseded version and the live
         // row holds the current one. UNION dedups; ORDER BY sorts. The live
         // version is always the max, so `current` falls out of the last row —
@@ -608,7 +632,7 @@ impl Store {
         slug: &str,
         version: u64,
     ) -> Result<Option<Vec<u8>>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         // Live row first — the current version is not copied into the archive.
         let live: Option<(i64, Vec<u8>)> = conn
             .query_row(
@@ -633,7 +657,7 @@ impl Store {
     }
 
     pub fn get_blueprint(&self, slug: &str) -> Result<Option<Blueprint>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT slug, created_at, delete_token, client_cwd FROM blueprints WHERE slug = ?1",
@@ -652,7 +676,7 @@ impl Store {
     }
 
     pub fn get_blueprint_html(&self, slug: &str) -> Result<Option<Vec<u8>>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT html FROM blueprints WHERE slug = ?1",
@@ -664,13 +688,13 @@ impl Store {
     }
 
     pub fn delete_blueprint(&self, slug: &str) -> Result<bool, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute("DELETE FROM blueprints WHERE slug = ?1", params![slug])?;
         Ok(n > 0)
     }
 
     pub fn list_blueprints(&self) -> Result<Vec<Blueprint>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT slug, created_at, delete_token, client_cwd FROM blueprints ORDER BY created_at DESC",
         )?;
@@ -690,7 +714,7 @@ impl Store {
     }
 
     pub fn list_blueprint_summaries(&self) -> Result<Vec<BlueprintSummary>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT \
                  b.slug, \
@@ -737,14 +761,14 @@ impl Store {
     ) -> Result<Comment, AppError> {
         let now = now_ms();
         let sel_json = serde_json::to_string(selector)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         // Stamp the version the comment is being written against, read under
         // the same lock so it can't race an interleaved update.
         let blueprint_version = read_version(&conn, slug)?;
         conn.execute(
             "INSERT INTO comments (id, slug, author, body, selector, parent_id, resolved, created_at, author_user_id, role, is_agent, blueprint_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
-            params![id, slug, author, body, sel_json, parent_id, now, author_user_id, role.as_str(), is_agent as i64, blueprint_version],
+            params![id, slug, author, body, sel_json, parent_id, now, author_user_id, role, is_agent, blueprint_version],
         )?;
         // If this comment is a reply, clear processing state on its parent — the agent
         // that was working on it has now produced its response.
@@ -791,7 +815,7 @@ impl Store {
             return Ok(vec![]);
         }
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
 
         // First pass: validate every parent_id either points at an existing
@@ -841,8 +865,8 @@ impl Store {
                     d.parent_id,
                     now,
                     d.author_user_id,
-                    d.role.as_str(),
-                    d.is_agent as i64,
+                    d.role,
+                    d.is_agent,
                     blueprint_version,
                 ],
             )?;
@@ -881,7 +905,7 @@ impl Store {
     }
 
     pub fn find_comment(&self, slug: &str, id: &str) -> Result<Option<Comment>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT c.id, c.slug, c.author, c.body, c.selector, c.parent_id, c.resolved, c.created_at,
@@ -896,7 +920,7 @@ impl Store {
     }
 
     pub fn list_comments(&self, slug: &str, since: Option<i64>) -> Result<Vec<Comment>, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.slug, c.author, c.body, c.selector, c.parent_id, c.resolved, c.created_at,
                     c.processing_by, c.processing_started_at, c.author_user_id, u.avatar_url, c.role, c.is_agent, c.blueprint_version
@@ -915,7 +939,7 @@ impl Store {
     /// comment exists; if not, returns false without changing anything.
     pub fn set_processing(&self, slug: &str, id: &str, author: &str) -> Result<bool, AppError> {
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE comments SET processing_by = ?1, processing_started_at = ?2
              WHERE slug = ?3 AND id = ?4",
@@ -927,7 +951,7 @@ impl Store {
     /// Clear processing state on a comment. Called automatically when a reply is posted
     /// to the parent (see add_comment), but also exposed for explicit clears.
     pub fn clear_processing(&self, slug: &str, id: &str) -> Result<(), AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE comments SET processing_by = NULL, processing_started_at = NULL
              WHERE slug = ?1 AND id = ?2",
@@ -937,10 +961,10 @@ impl Store {
     }
 
     pub fn set_resolved(&self, slug: &str, id: &str, resolved: bool) -> Result<bool, AppError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE comments SET resolved = ?1 WHERE slug = ?2 AND id = ?3",
-            params![resolved as i64, slug, id],
+            params![resolved, slug, id],
         )?;
         Ok(n > 0)
     }
@@ -1005,9 +1029,7 @@ fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
     let selector: TextQuoteSelector = serde_json::from_str(&sel_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
     })?;
-    let resolved: i64 = r.get(6)?;
-    let role_str: String = r.get(12)?;
-    let is_agent_int: i64 = r.get(13)?;
+    // `bool` and `AuthorRole` both have FromSql, so no `as i64` / `!= 0` here.
     Ok(Comment {
         id: r.get(0)?,
         slug: r.get(1)?,
@@ -1015,14 +1037,14 @@ fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
         body: r.get(3)?,
         selector,
         parent_id: r.get(5)?,
-        resolved: resolved != 0,
+        resolved: r.get(6)?,
         created_at: r.get(7)?,
         processing_by: r.get(8)?,
         processing_started_at: r.get(9)?,
         author_user_id: r.get(10)?,
         author_avatar_url: r.get(11)?,
-        role: AuthorRole::from_str(&role_str),
-        is_agent: is_agent_int != 0,
+        role: r.get(12)?,
+        is_agent: r.get(13)?,
         blueprint_version: r.get(14)?,
     })
 }

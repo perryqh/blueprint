@@ -324,7 +324,7 @@ struct CreateBlueprintOutput {
 
 async fn create_blueprint(
     State(state): State<AppState>,
-    _w: crate::auth::WriteIdentity,
+    _w: crate::auth::BlueprintWrite,
     headers: HeaderMap,
     Json(input): Json<CreateBlueprintInput>,
 ) -> Result<Json<CreateBlueprintOutput>, AppError> {
@@ -381,7 +381,7 @@ struct UpdateBlueprintInput {
 
 async fn update_blueprint(
     State(state): State<AppState>,
-    _w: crate::auth::WriteIdentity,
+    _w: crate::auth::BlueprintWrite,
     Path(slug): Path<String>,
     Json(input): Json<UpdateBlueprintInput>,
 ) -> Result<StatusCode, AppError> {
@@ -411,18 +411,26 @@ async fn get_blueprint_raw(
     Query(q): Query<RawQuery>,
     headers: HeaderMap,
 ) -> Response {
-    // The reviewer embeds this document in a same-origin iframe and reaches
-    // into its `contentDocument` to place highlights and inject theme styles —
-    // so it MUST stay same-origin for the embed. A `sandbox` CSP would force an
-    // opaque origin and silently break anchoring. We only want to sandbox the
-    // *escalation* case: someone opening `/raw` as a top-level page (a shared
-    // link, "open frame in new tab", the version-badge snapshot link), where
-    // agent-authored script would otherwise run in the daemon origin. Browsers
-    // tag that load `Sec-Fetch-Dest: document`; the iframe embed is tagged
-    // `iframe`. Gate on that so the embed keeps same-origin access while a
-    // direct open is sandboxed.
-    let top_level_nav =
-        headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) == Some("document");
+    // The reviewer embeds this document in a same-origin iframe and reaches into
+    // its `contentDocument` to place highlights and inject theme styles — so it
+    // MUST stay same-origin for the embed. A `sandbox` CSP would force an opaque
+    // origin and silently break anchoring. Everything else should be sandboxed,
+    // because the HTML is agent-authored and would otherwise run in the daemon
+    // origin.
+    //
+    // This is deliberately fail-*closed*. It used to ask "is this
+    // `Sec-Fetch-Dest: document`?" and sandbox only then — which meant a missing
+    // header (curl, an older browser, a request crafted without it) or any other
+    // destination (`embed`, `object`, `frame`) skipped the sandbox entirely.
+    // Asking the inverse question means an unrecognised or absent value gets the
+    // restrictive answer.
+    //
+    // Worth being clear about what this is: hardening, not a boundary. The real
+    // control is the iframe's own `sandbox` attribute in reviewer.html.
+    let trusted_embed = headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|dest| dest == "iframe");
     let fetched = match q.version {
         Some(v) => state.store.get_blueprint_html_at(&slug, v),
         None => state.store.get_blueprint_html(&slug),
@@ -436,16 +444,24 @@ async fn get_blueprint_raw(
             );
             resp.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            // Sandbox a direct top-level open into an opaque origin (allow-scripts
-            // so Prism/Mermaid still run, never allow-same-origin) so agent HTML
-            // can't reach the daemon origin's storage or window.open the reviewer.
-            // Skipped for the iframe embed, which needs same-origin access.
-            if top_level_nav {
+            // Sandbox anything that isn't our own iframe embed into an opaque
+            // origin (allow-scripts so Prism/Mermaid still run, never
+            // allow-same-origin) so agent HTML can't reach the daemon origin's
+            // storage or window.open the reviewer.
+            if !trusted_embed {
                 resp.headers_mut().insert(
                     header::CONTENT_SECURITY_POLICY,
                     HeaderValue::from_static("sandbox allow-scripts"),
                 );
             }
+            // Independently of the sandbox: nothing anywhere set a framing policy,
+            // so any origin could frame `/raw` and read it cross-origin via the
+            // user's session. The reviewer's own embed is same-origin, so
+            // SAMEORIGIN costs us nothing.
+            resp.headers_mut().insert(
+                header::X_FRAME_OPTIONS,
+                HeaderValue::from_static("SAMEORIGIN"),
+            );
             resp
         }
         Ok(None) => (StatusCode::NOT_FOUND, "blueprint not found").into_response(),
@@ -472,7 +488,7 @@ async fn list_blueprint_versions(
 
 async fn delete_blueprint(
     State(state): State<AppState>,
-    _w: crate::auth::WriteIdentity,
+    _w: crate::auth::BlueprintWrite,
     Path(slug): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let removed = state.store.delete_blueprint(&slug)?;
@@ -514,7 +530,25 @@ async fn build_comments_response(
     slug: &str,
     comments: Vec<Comment>,
 ) -> CommentsResponse {
-    let server_ts = crate::store::now_ms();
+    // The watermark must never run ahead of the newest row we're handing back.
+    //
+    // This used to be `now_ms()`, sampled *after* the caller had already read
+    // from SQLite. A comment inserted in between got a `created_at` below the
+    // watermark while never appearing in the result set — and since the client
+    // feeds this straight back as `since`, and `list_comments` filters on a
+    // strict `created_at > ?`, that comment was skipped by every later poll,
+    // permanently. The window is small but it is exactly the window a
+    // Submit-all batch lands in, and the 30s reconnect loop reopened it.
+    //
+    // Deriving it from the data closes that: anything newer than what we
+    // returned is, by construction, still greater than the watermark. When the
+    // read came back empty there's nothing to be newer than, so the clock is
+    // the right answer.
+    let server_ts = comments
+        .iter()
+        .map(|c| c.created_at)
+        .max()
+        .unwrap_or_else(crate::store::now_ms);
     let blueprint_version = state.blueprint_version(slug);
     let batch_processing = state.current_batch_processing(slug).await;
     // A missing/unknown slug reads as "not finished" — this response is built on
