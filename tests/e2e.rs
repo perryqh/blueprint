@@ -956,6 +956,43 @@ fn location(r: &reqwest::Response) -> String {
         .to_string()
 }
 
+/// The `ps_session=<value>` pair from a response's `Set-Cookie`, if it set one.
+fn session_cookie(r: &reqwest::Response) -> Option<String> {
+    r.headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| v.split(';').next().filter(|p| p.starts_with("ps_session=")))
+        .map(|p| p.to_string())
+}
+
+/// Send `cookie` to `/api/me` from a client holding no other state — replaying a
+/// captured session id the way a stale tab or a copied cookie would.
+async fn replay_session(base: &str, cookie: &str) -> reqwest::StatusCode {
+    client()
+        .get(format!("{base}/api/me"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Drive the full mock-GitHub round trip on `http`, returning the session
+/// cookie the daemon ended up issuing.
+async fn login_via_mock(http: &reqwest::Client, base: &str) -> String {
+    let r1 = http.get(format!("{base}/login")).send().await.unwrap();
+    let issued = session_cookie(&r1);
+    let r2 = http.get(location(&r1)).send().await.unwrap();
+    let r3 = http.get(location(&r2)).send().await.unwrap();
+    assert_eq!(r3.status(), 303, "callback should complete the login");
+    // The callback re-saves the session; it only re-issues the cookie if the id
+    // changed, so fall back to the one /login handed out.
+    session_cookie(&r3)
+        .or(issued)
+        .expect("login issues a session cookie")
+}
+
 async fn mock_authorize(AxumQuery(p): AxumQuery<HashMap<String, String>>) -> Redirect {
     // GitHub would render a consent UI here; we just bounce straight back to the
     // daemon's callback URL with a synthetic code, preserving the state nonce.
@@ -1149,6 +1186,73 @@ async fn callback_with_bad_state_returns_400() {
         .await
         .unwrap();
     assert_eq!(r.status(), 400);
+}
+
+/// Logout has to invalidate the session *server-side*, not just drop the
+/// cookie. Now that records outlive the process, a row left behind would keep
+/// working for anyone who kept a copy of the cookie value — so replay it.
+#[tokio::test]
+async fn logout_invalidates_the_session_server_side() {
+    let s = spawn_with_auth().await;
+    let http = browser_client();
+    let cookie = login_via_mock(&http, &s.daemon_base).await;
+
+    // Establish that the captured cookie is the *authenticated* one, replayed
+    // the same way the post-logout check will replay it. Without this the test
+    // could pass on a cookie that was never valid to begin with.
+    assert_eq!(
+        replay_session(&s.daemon_base, &cookie).await,
+        200,
+        "precondition: the captured cookie authenticates"
+    );
+
+    let r = http
+        .post(format!("{}/logout", s.daemon_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    // Same replay, on a client that never saw the logout. If the row survived,
+    // this would still authenticate.
+    assert_eq!(
+        replay_session(&s.daemon_base, &cookie).await,
+        401,
+        "a logged-out session id must not authenticate"
+    );
+}
+
+/// Agent and anonymous traffic must not mint session rows. This is the hot path
+/// — every `blueprint` command and every sidebar poll — and it's why
+/// `identity_from_request` checks the bearer token before touching the session.
+/// A stray write here would put a database round trip on all of it.
+#[tokio::test]
+async fn agent_and_anonymous_traffic_issue_no_session() {
+    let s = spawn_with_auth().await;
+    let http = client();
+
+    let cli = http
+        .get(format!("{}/api/blueprints", s.daemon_base))
+        .bearer_auth(&s.cli_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        session_cookie(&cli).is_none(),
+        "CLI bearer traffic should not start a session"
+    );
+
+    for path in ["/api/health", "/api/blueprints", "/api/me"] {
+        let r = http
+            .get(format!("{}{}", s.daemon_base, path))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            session_cookie(&r).is_none(),
+            "anonymous GET {path} should not start a session"
+        );
+    }
 }
 
 /// A callback whose session never started a login (cookies cleared, or the

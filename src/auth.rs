@@ -122,14 +122,6 @@ fn ensure_cli_token() -> String {
     token
 }
 
-/// Read SESSION_SECRET from env. Used only to detect when auth has been configured
-/// (the secret value itself is not consumed — tower-sessions signs cookies with its
-/// internal HMAC key derived from the store).
-#[allow(dead_code)]
-pub fn session_secret_configured() -> bool {
-    std::env::var("SESSION_SECRET").is_ok()
-}
-
 /// Try to load ~/.blueprint/env into process env. Quietly ignores a missing file
 /// (auth disabled), but fails loudly if the file exists and is malformed.
 pub fn load_env_file() -> Result<(), AppError> {
@@ -348,6 +340,13 @@ pub async fn callback(
     let expected: Option<String> = session.get(SESSION_OAUTH_STATE).await.unwrap_or(None);
     match expected {
         Some(s) if s == params.state => {
+            // Consumed on the happy path. Note the removal only reaches the
+            // store if this request ends in a non-5xx response — tower-sessions
+            // deliberately skips saving on server errors. So if the token
+            // exchange below fails, the nonce survives and the user can retry
+            // the whole round trip; that's the behavior we want, not an
+            // oversight, but it does mean the nonce isn't single-use when the
+            // exchange breaks.
             session.remove::<String>(SESSION_OAUTH_STATE).await.ok();
         }
         // Present but different: a replayed, stale, or forged callback. Refuse

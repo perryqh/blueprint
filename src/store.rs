@@ -127,6 +127,13 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // Owner-only, before WAL exists. A tower-sessions id is a bearer
+        // credential — there's no signing and no server-side secret, so
+        // whoever can read a session row can impersonate that user. The
+        // database therefore needs the same 0600 that `ensure_cli_token`
+        // already gives the CLI token. Done before `journal_mode = WAL` so
+        // the `-wal` and `-shm` files, which carry the same rows, inherit it.
+        restrict_to_owner(path)?;
         conn.execute_batch(
             r#"
             PRAGMA foreign_keys = ON;
@@ -949,6 +956,46 @@ fn read_version(conn: &Connection, slug: &str) -> Result<Option<i64>, AppError> 
         .optional()?)
 }
 
+/// Clamp the database — and its WAL sidecars, if they already exist — to
+/// owner-only. Covers the sidecars explicitly rather than relying on SQLite to
+/// inherit the mode, so a database created before this change gets fixed up on
+/// the next open instead of staying readable.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    for p in [
+        path.to_path_buf(),
+        sidecar(path, "-wal"),
+        sidecar(path, "-shm"),
+    ] {
+        // A sidecar that isn't there yet inherits the mode we just set on the
+        // database, so a missing file is nothing to fix.
+        if !p.exists() {
+            continue;
+        }
+        let mut perms = std::fs::metadata(&p)?.permissions();
+        if perms.mode() & 0o077 != 0 {
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&p, perms)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> Result<(), AppError> {
+    Ok(())
+}
+
+/// `foo.db` + `-wal` → `foo.db-wal`, matching how SQLite names its sidecars
+/// (a suffix on the full filename, not a replaced extension).
+#[cfg(unix)]
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
 fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
     let sel_json: String = r.get(4)?;
     let selector: TextQuoteSelector = serde_json::from_str(&sel_json).map_err(|e| {
@@ -981,4 +1028,47 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The database holds session rows, and a session id is a bearer credential.
+    /// It — and the WAL sidecars carrying the same rows — must not be readable
+    /// by other local users.
+    #[test]
+    fn database_and_wal_sidecars_are_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("blueprints.db");
+        let store = Store::open(&db).unwrap();
+        // Force the WAL sidecars into existence.
+        store.save_session("id", "{}", now_ms() + 60_000).unwrap();
+
+        assert_eq!(mode_of(&db), 0o600, "database should be owner-only");
+        for suffix in ["-wal", "-shm"] {
+            let side = sidecar(&db, suffix);
+            assert!(side.exists(), "expected {suffix} to exist");
+            assert_eq!(mode_of(&side), 0o600, "{suffix} should be owner-only");
+        }
+    }
+
+    /// A database created before sessions moved to disk is group/world-readable.
+    /// Opening it has to tighten it rather than leave the old mode in place.
+    #[test]
+    fn open_tightens_a_preexisting_world_readable_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("blueprints.db");
+        drop(Store::open(&db).unwrap());
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&db), 0o644, "precondition");
+
+        let _store = Store::open(&db).unwrap();
+        assert_eq!(mode_of(&db), 0o600);
+    }
 }

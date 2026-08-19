@@ -205,9 +205,6 @@ pub fn router(state: AppState) -> Router {
     // process-local store broke the OAuth handshake outright. See
     // `crate::session_store`.
     let session_store = crate::session_store::SqliteSessionStore::new(state.store.clone());
-    if let Err(e) = state.store.delete_expired_sessions() {
-        tracing::warn!(%e, "could not sweep expired sessions");
-    }
     let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(false) // localhost = http
         .with_same_site(SameSite::Lax)

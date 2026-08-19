@@ -100,15 +100,35 @@ impl SessionStore for SqliteSessionStore {
             .map_err(backend)
     }
 
+    /// A row we can't make sense of is reported as a *miss*, not an error.
+    /// Returning `Err` here propagates out of `Session::insert` and 500s every
+    /// `/login` from the holder of that cookie, with nothing short of clearing
+    /// cookies to break out; a miss makes tower-sessions mint a fresh session
+    /// and the next request just works. The bad row is dropped on the way out so
+    /// the condition can't recur.
     async fn load(&self, session_id: &Id) -> SessionResult<Option<Record>> {
-        let raw = self
-            .store
-            .load_session(&session_id.to_string())
-            .map_err(backend)?;
-        match raw {
-            Some(raw) => Ok(Some(decode(&raw)?)),
-            None => Ok(None),
+        let key = session_id.to_string();
+        let Some(raw) = self.store.load_session(&key).map_err(backend)? else {
+            return Ok(None);
+        };
+        let discard = |reason: &str| {
+            tracing::warn!(session_id = %key, reason, "discarding unreadable session row");
+            if let Err(e) = self.store.delete_session(&key) {
+                tracing::warn!(%e, "could not delete unreadable session row");
+            }
+        };
+        let Ok(record) = decode(&raw) else {
+            discard("record did not decode");
+            return Ok(None);
+        };
+        // The id is both the primary key and a field inside the record. They can
+        // only disagree if a row was corrupted or hand-edited, and trusting the
+        // record's copy would hand back a session under the wrong key.
+        if record.id != *session_id {
+            discard("record id disagrees with its key");
+            return Ok(None);
         }
+        Ok(Some(record))
     }
 
     async fn delete(&self, session_id: &Id) -> SessionResult<()> {
@@ -137,6 +157,48 @@ mod tests {
             data,
             expiry_date: OffsetDateTime::now_utc() + offset,
         }
+    }
+
+    /// A row that won't decode must read as a miss and be swept, not raise —
+    /// an `Err` here 500s every `/login` from that cookie holder for good.
+    #[tokio::test]
+    async fn undecodable_row_reads_as_a_miss_and_is_dropped() {
+        let (_tmp, s) = store();
+        let mut r = record(Duration::days(1));
+        s.create(&mut r).await.unwrap();
+        s.store
+            .save_session(&r.id.to_string(), "{ not json at all", i64::MAX)
+            .unwrap();
+
+        assert!(
+            s.load(&r.id).await.is_ok_and(|r| r.is_none()),
+            "a corrupt row must degrade to a miss, not an error"
+        );
+        assert!(
+            s.store.load_session(&r.id.to_string()).unwrap().is_none(),
+            "the bad row should be gone so the condition can't recur"
+        );
+    }
+
+    /// The id is stored twice — as the primary key and inside the record. If
+    /// they disagree the row is untrustworthy, so don't hand it back.
+    #[tokio::test]
+    async fn row_whose_record_id_disagrees_with_its_key_is_rejected() {
+        let (_tmp, s) = store();
+        let mut r = record(Duration::days(1));
+        s.create(&mut r).await.unwrap();
+        let mut impostor = record(Duration::days(1));
+        impostor.id = Id::default();
+        s.store
+            .save_session(
+                &r.id.to_string(),
+                &serde_json::to_string(&impostor).unwrap(),
+                i64::MAX,
+            )
+            .unwrap();
+
+        assert!(s.load(&r.id).await.unwrap().is_none());
+        assert!(s.store.load_session(&r.id.to_string()).unwrap().is_none());
     }
 
     #[tokio::test]
