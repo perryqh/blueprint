@@ -891,13 +891,12 @@ struct AuthedTest {
     _tmp: TempDir,
 }
 
-/// Spawn a daemon with auth enabled, plus an in-process mock GitHub server.
-/// The daemon's AuthConfig.oauth_* URLs point at the mock.
-async fn spawn_with_auth() -> AuthedTest {
-    // Mock GitHub.
+const TEST_CLI_TOKEN: &str = "test-cli-token-deadbeef";
+
+/// Spawn an in-process mock GitHub and return its base URL.
+async fn spawn_mock_github() -> String {
     let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock_addr = mock_listener.local_addr().unwrap();
-    let mock_base = format!("http://{}", mock_addr);
     let mock_app = axum::Router::new()
         .route("/login/oauth/authorize", get(mock_authorize))
         .route("/login/oauth/access_token", post(mock_token))
@@ -905,10 +904,15 @@ async fn spawn_with_auth() -> AuthedTest {
     tokio::spawn(async move {
         let _ = axum::serve(mock_listener, mock_app).await;
     });
+    format!("http://{}", mock_addr)
+}
 
-    // Daemon. AuthConfig.callback_url needs the daemon URL, so bind first.
+/// Spawn an auth-enabled daemon over a caller-supplied store, with its OAuth
+/// endpoints pointed at `mock_base`. Taking the store lets a test stand up a
+/// *second* daemon over the same database to simulate a restart.
+async fn spawn_auth_daemon_with_store(store: Arc<Store>, mock_base: &str) -> String {
+    // AuthConfig.callback_url needs the daemon URL, so bind first.
     let (listener, daemon_base) = bind_listener().await;
-    let cli_token = "test-cli-token-deadbeef".to_string();
     let auth = AuthConfig {
         client_id: "test-client".into(),
         client_secret: "test-secret".into(),
@@ -917,16 +921,39 @@ async fn spawn_with_auth() -> AuthedTest {
         authorize_url: format!("{}/login/oauth/authorize", mock_base),
         token_url: format!("{}/login/oauth/access_token", mock_base),
         profile_url: format!("{}/user", mock_base),
-        cli_token: cli_token.clone(),
+        cli_token: TEST_CLI_TOKEN.into(),
         owner_login: None,
     };
-    let tmp = spawn_daemon_on(listener, Some(Arc::new(auth))).await;
+    let app = router(AppState::with_auth(store, Some(Arc::new(auth))));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    daemon_base
+}
+
+/// Spawn a daemon with auth enabled, plus an in-process mock GitHub server.
+/// The daemon's AuthConfig.oauth_* URLs point at the mock.
+async fn spawn_with_auth() -> AuthedTest {
+    let mock_base = spawn_mock_github().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(Store::open(&tmp.path().join("blueprints.db")).expect("open store"));
+    let daemon_base = spawn_auth_daemon_with_store(store, &mock_base).await;
 
     AuthedTest {
         daemon_base,
-        cli_token,
+        cli_token: TEST_CLI_TOKEN.into(),
         _tmp: tmp,
     }
+}
+
+/// `Location` header of a redirect response, as an owned String.
+fn location(r: &reqwest::Response) -> String {
+    r.headers()
+        .get("location")
+        .expect("redirect has a Location")
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 async fn mock_authorize(AxumQuery(p): AxumQuery<HashMap<String, String>>) -> Redirect {
@@ -1046,6 +1073,62 @@ async fn full_oauth_round_trip_authenticates_user() {
     assert_eq!(r4["avatar_url"], "https://example.com/mockuser.png");
 }
 
+/// The OAuth handshake has to survive a daemon restart. The daemon is
+/// deliberately short-lived — every `blueprint` invocation may respawn it and
+/// `POST /api/shutdown-if-empty` stops it — so a restart landing inside the
+/// few seconds the user spends on GitHub's consent screen is routine, not
+/// exotic. While the CSRF nonce lived in a process-local session store, that
+/// restart surfaced as a dead-end `state mismatch or missing` 400.
+#[tokio::test]
+async fn oauth_round_trip_survives_daemon_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("blueprints.db");
+    let mock_base = spawn_mock_github().await;
+    let http = browser_client();
+
+    // Daemon #1 starts the handshake and stashes the state nonce.
+    let store1 = Arc::new(Store::open(&db).unwrap());
+    let base1 = spawn_auth_daemon_with_store(store1, &mock_base).await;
+    let r1 = http.get(format!("{base1}/login")).send().await.unwrap();
+    assert_eq!(r1.status(), 303);
+    let r2 = http.get(location(&r1)).send().await.unwrap();
+    assert_eq!(r2.status(), 303);
+    // The mock bounced back to daemon #1's callback URL. Keep the query
+    // (code + the real state nonce) and re-point it at the restarted daemon,
+    // which in production would be listening on the same port 7321.
+    let callback_query = location(&r2)
+        .split_once('?')
+        .expect("callback carries code + state")
+        .1
+        .to_string();
+
+    // Daemon #2 is the restart: fresh process state, same database.
+    let store2 = Arc::new(Store::open(&db).unwrap());
+    let base2 = spawn_auth_daemon_with_store(store2, &mock_base).await;
+
+    let r3 = http
+        .get(format!("{base2}/auth/github/callback?{callback_query}"))
+        .send()
+        .await
+        .unwrap();
+    let status = r3.status();
+    let body = r3.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 303,
+        "callback after a restart should complete the login; got body: {body}"
+    );
+
+    // And the session it just wrote is durable too — a *third* daemon still
+    // recognizes the user, so a restart no longer silently demotes the owner
+    // to `guest` and stops their comments from tripping a plan edit.
+    let store3 = Arc::new(Store::open(&db).unwrap());
+    let base3 = spawn_auth_daemon_with_store(store3, &mock_base).await;
+    let r4 = http.get(format!("{base3}/api/me")).send().await.unwrap();
+    assert_eq!(r4.status(), 200, "session should outlive the daemon");
+    let me: Value = r4.json().await.unwrap();
+    assert_eq!(me["login"], "mockuser");
+}
+
 #[tokio::test]
 async fn callback_with_bad_state_returns_400() {
     let s = spawn_with_auth().await;
@@ -1066,6 +1149,25 @@ async fn callback_with_bad_state_returns_400() {
         .await
         .unwrap();
     assert_eq!(r.status(), 400);
+}
+
+/// A callback whose session never started a login (cookies cleared, or the
+/// session lapsed while the consent screen sat open) still 400s, but offers a
+/// retry link rather than the bare dead-end error string it used to.
+#[tokio::test]
+async fn callback_without_a_login_offers_a_retry() {
+    let s = spawn_with_auth().await;
+    let r = browser_client()
+        .get(format!(
+            "{}/auth/github/callback?code=mock-code&state=whatever",
+            s.daemon_base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("href=\"/login\""), "no retry link in {body}");
 }
 
 #[tokio::test]

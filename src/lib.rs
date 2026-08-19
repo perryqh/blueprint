@@ -6,5 +6,6 @@ pub mod mcp;
 pub mod review_file;
 pub mod selector;
 pub mod server;
+pub mod session_store;
 pub mod slug;
 pub mod store;

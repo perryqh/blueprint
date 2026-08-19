@@ -177,6 +177,21 @@ impl Store {
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
             );
+
+            -- Browser sessions, keyed by the opaque cookie id. `record` is the
+            -- serialized tower-sessions Record (its own JSON shape, opaque to
+            -- us); `expires_at` is that record's expiry lifted into a column so
+            -- expiry can be enforced and swept in SQL. This is on disk rather
+            -- than in memory because the daemon is short-lived by design — see
+            -- `crate::session_store`.
+            CREATE TABLE IF NOT EXISTS sessions (
+              id         TEXT PRIMARY KEY,
+              record     TEXT NOT NULL,
+              expires_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
+              ON sessions(expires_at);
             "#,
         )?;
 
@@ -334,6 +349,74 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    // -----------------------------------------------------------------------
+    // Session records. The serialized-record shape belongs to tower-sessions;
+    // these are deliberately dumb key/value accessors so `crate::session_store`
+    // owns all of the encoding. `expires_at` is a wall-clock ms deadline.
+    // -----------------------------------------------------------------------
+
+    /// Insert a brand-new session. Returns `false` if `id` was already taken,
+    /// which is the caller's signal to re-roll the id rather than clobber a
+    /// live session belonging to someone else.
+    pub fn insert_session(
+        &self,
+        id: &str,
+        record: &str,
+        expires_at: i64,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, record, expires_at) VALUES (?1, ?2, ?3)",
+            params![id, record, expires_at],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Write a session, creating it if absent. Used for updates to a session
+    /// that already exists (a fresh one goes through `insert_session`).
+    pub fn save_session(&self, id: &str, record: &str, expires_at: i64) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, record, expires_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               record = excluded.record,
+               expires_at = excluded.expires_at",
+            params![id, record, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Load a session's serialized record, treating an expired row as absent.
+    pub fn load_session(&self, id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT record FROM sessions WHERE id = ?1 AND expires_at > ?2",
+                params![id, now_ms()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn delete_session(&self, id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Drop every session past its expiry. Called once at daemon startup —
+    /// expired rows are already invisible to `load_session`, so this is only
+    /// housekeeping to keep the table from growing without bound.
+    pub fn delete_expired_sessions(&self) -> Result<usize, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ?1",
+            params![now_ms()],
+        )?;
+        Ok(rows)
     }
 
     pub fn insert_blueprint(
