@@ -16,6 +16,13 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    # rustfmt and clippy come from rust-toolchain.toml, which also pins the
+    # version — so a formatting or lint disagreement here means the code
+    # changed, not that the runner shipped a different toolchain than you have.
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
     - name: Build
       run: cargo build --verbose
     - name: Run tests
