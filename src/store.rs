@@ -537,7 +537,11 @@ impl Store {
         if !claimed {
             // Distinguish "nothing pending" from "no such blueprint".
             let exists = read_version(&conn, slug)?.is_some();
-            return if exists { Ok(None) } else { Err(AppError::NotFound) };
+            return if exists {
+                Ok(None)
+            } else {
+                Err(AppError::NotFound)
+            };
         }
         let stamp: Option<Option<i64>> = conn
             .query_row(
