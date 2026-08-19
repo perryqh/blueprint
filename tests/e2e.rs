@@ -1680,7 +1680,7 @@ async fn batch_processing_auto_clears_after_all_parents_replied() {
     // First reply: still active (one pending parent left).
     http.post(format!(
         "{}/api/blueprints/bp3/comments/{}/replies",
-        s.base, &ids[0]
+        s.base, ids[0]
     ))
     .json(&json!({ "author": "Claude Code", "body": "done" }))
     .send()
@@ -1704,7 +1704,7 @@ async fn batch_processing_auto_clears_after_all_parents_replied() {
     // Second reply on the last pending parent → indicator clears.
     http.post(format!(
         "{}/api/blueprints/bp3/comments/{}/replies",
-        s.base, &ids[1]
+        s.base, ids[1]
     ))
     .json(&json!({ "author": "Claude Code", "body": "also done" }))
     .send()
