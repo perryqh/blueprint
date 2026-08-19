@@ -55,6 +55,59 @@ async fn raw_sandboxes_top_level_open_but_not_iframe_embed() {
     );
 }
 
+/// The case the two assertions above didn't cover, and the one that mattered:
+/// the gate reads a header the *client* controls, so the interesting question is
+/// what happens when it says something we didn't anticipate — or nothing at all.
+///
+/// It used to ask "is this `Sec-Fetch-Dest: document`?" and sandbox only then, so
+/// a missing header (curl, an older browser, a hand-rolled request) or any other
+/// destination served agent-authored HTML *unsandboxed* in the daemon's origin.
+/// Now anything that isn't positively our own iframe embed gets the sandbox.
+#[tokio::test]
+async fn raw_sandboxes_by_default_when_fetch_metadata_is_absent_or_unexpected() {
+    let s = spawn().await;
+    let http = client();
+    publish(&http, &s.base, "csp-default").await;
+
+    // `embed` and `object` are real framing destinations a hostile page can use;
+    // `frame` is the legacy one; the garbage value stands in for anything future
+    // browsers add. None of them are our iframe, so all must be sandboxed.
+    for dest in [
+        None,
+        Some("embed"),
+        Some("object"),
+        Some("frame"),
+        Some("!?"),
+    ] {
+        let mut req = http.get(format!("{}/api/blueprints/csp-default/raw", s.base));
+        if let Some(d) = dest {
+            req = req.header("sec-fetch-dest", d);
+        }
+        let r = req.send().await.unwrap();
+        assert_eq!(r.status(), 200);
+
+        let label = dest.unwrap_or("<absent>");
+        assert_eq!(
+            r.headers()
+                .get("content-security-policy")
+                .unwrap_or_else(|| panic!("no sandbox CSP for sec-fetch-dest: {label}"))
+                .to_str()
+                .unwrap(),
+            "sandbox allow-scripts",
+            "sec-fetch-dest {label} must be sandboxed"
+        );
+        assert_eq!(
+            r.headers()
+                .get("x-frame-options")
+                .expect("framing policy must always be set")
+                .to_str()
+                .unwrap(),
+            "SAMEORIGIN",
+            "any origin could otherwise frame /raw and read it cross-origin"
+        );
+    }
+}
+
 #[tokio::test]
 async fn oversize_body_is_rejected_with_413() {
     let s = spawn().await;

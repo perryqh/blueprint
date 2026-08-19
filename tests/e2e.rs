@@ -218,15 +218,17 @@ async fn publish_comment_reply_finish_fetch_drift_unpublish() {
 
     // 10b. That waiter consumed the latch, so a second `wait` must park rather
     //      than resolve — otherwise every later round would end instantly.
-    //      Timing out here is the pass condition.
+    //      Assert specifically on a timeout: a bare `is_err()` would also be
+    //      satisfied by a panic, a refused connection, or a reset socket.
     let already_claimed = http
         .get(format!("{}/api/blueprints/test-plan/wait", s.base))
         .timeout(Duration::from_millis(300))
         .send()
         .await;
+    let err = already_claimed.expect_err("an already-claimed finish must not resolve a later wait");
     assert!(
-        already_claimed.is_err(),
-        "an already-claimed finish must not resolve a later wait"
+        err.is_timeout(),
+        "expected the wait to park until the client timed out, got: {err}"
     );
 
     // 10c. The durability guarantee, and the case that used to silently hang:
@@ -368,11 +370,21 @@ async fn create_with_random_slug_when_none_provided() {
         .await
         .unwrap();
     let slug = r["slug"].as_str().unwrap();
-    // adjective-month-animal pattern: three hyphen-separated words
+    // adjective-month-animal-suffix. The suffix is what takes the space from
+    // 6,912 to ~11.6M; see `slug::SUFFIX_LEN` for why 6,912 wasn't enough given
+    // that the create path is a bare INSERT with no collision retry.
+    let parts: Vec<&str> = slug.split('-').collect();
     assert_eq!(
-        slug.split('-').count(),
-        3,
-        "slug should be three words, got {slug:?}"
+        parts.len(),
+        4,
+        "slug should be three words plus an entropy suffix, got {slug:?}"
+    );
+    assert_eq!(parts[3].len(), 4, "unexpected suffix length in {slug:?}");
+    assert!(
+        parts.iter().all(|p| p
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())),
+        "slug must stay URL-safe lowercase, got {slug:?}"
     );
 }
 

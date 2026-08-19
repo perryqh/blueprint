@@ -114,15 +114,22 @@ async fn a_claimed_finish_does_not_resolve_the_next_round() {
         .expect("first wait claims the finish");
     assert_eq!(r.status(), 200);
 
-    // Second wait has nothing to claim and must park. Timing out is the pass.
+    // Second wait has nothing to claim and must park.
+    //
+    // Parking can only be observed as "the client gave up first", so the
+    // assertion has to be specifically that — a timeout. Asserting bare
+    // `is_err()` would also pass if the server panicked, refused the
+    // connection, or reset the socket, which is the opposite of what this test
+    // exists to prove.
     let second = http
         .get(format!("{}/api/blueprints/p/wait", s.base))
         .timeout(Duration::from_millis(300))
         .send()
         .await;
+    let err = second.expect_err("an already-claimed finish must not resolve a later wait");
     assert!(
-        second.is_err(),
-        "an already-claimed finish must not resolve a later wait"
+        err.is_timeout(),
+        "expected the wait to park until the client timed out, but it failed for another reason: {err}"
     );
 
     // Clicking again re-raises the latch, so a new round can end.

@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// HTTP client preconfigured with the daemon's CLI bearer token.
@@ -13,7 +14,18 @@ use std::time::Duration;
 /// If the file is missing or empty, the client sends no auth header (legacy mode).
 /// Also sets `X-Client-Cwd` to the current working directory so the daemon can
 /// surface which repo published a blueprint in `blueprint status`.
+/// Built once per process and cloned thereafter: `reqwest::Client` is
+/// `Arc`-backed, so a clone shares the connection pool rather than rebuilding the
+/// whole TLS/pool stack — and the headers it bakes in (bearer token, cwd) are
+/// fixed for this process's lifetime anyway. A build failure degrades to a
+/// header-less default client instead of panicking in library code; the daemon
+/// then answers 401 and the user gets a message rather than a backtrace.
 pub(crate) fn cli_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(build_cli_http_client).clone()
+}
+
+fn build_cli_http_client() -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(token) = read_cli_token()
         && let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
@@ -30,7 +42,10 @@ pub(crate) fn cli_http_client() -> reqwest::Client {
         .default_headers(headers)
         .timeout(Duration::from_secs(120))
         .build()
-        .expect("reqwest client builds")
+        .unwrap_or_else(|e| {
+            tracing::warn!(%e, "could not build the CLI http client; falling back to an unauthenticated default");
+            reqwest::Client::new()
+        })
 }
 
 fn read_cli_token() -> Option<String> {
@@ -56,6 +71,17 @@ pub(crate) async fn ensure_success(
     bail!("{what} failed: {status} {body}")
 }
 
+/// Reject port 0. `resolve_port` treats `None` as "use the default", so a 0 here
+/// wouldn't mean "pick a free port" — it would bind an arbitrary ephemeral port
+/// and silently break the OAuth callback, which needs a predictable one.
+fn parse_port(s: &str) -> Result<u16, String> {
+    match s.parse::<u16>() {
+        Ok(0) => Err("port 0 is not allowed; omit --port to use the default (7321)".into()),
+        Ok(p) => Ok(p),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "blueprint",
@@ -71,8 +97,10 @@ pub struct Cli {
 pub enum Cmd {
     /// Run the HTTP daemon in this process. Normally spawned automatically.
     Serve {
-        /// Bind to a specific port (default: random).
-        #[arg(long)]
+        /// Bind to a specific port. Defaults to $BLUEPRINT_PORT, else 7321 —
+        /// the port baked into the registered GitHub OAuth callback URL, so
+        /// overriding it breaks the login round-trip.
+        #[arg(long, value_parser = parse_port)]
         port: Option<u16>,
     },
     /// Print daemon status (port, PID, active blueprints).
@@ -85,7 +113,10 @@ pub enum Cmd {
         #[arg(long)]
         slug: Option<String>,
         /// If a slug already exists, replace its HTML in place.
-        #[arg(long)]
+        /// Requires --slug: there is nothing to update without a target, and
+        /// letting clap enforce that yields a usage message *before* we spawn a
+        /// daemon and read the file.
+        #[arg(long, requires = "slug")]
         update: bool,
         /// Don't open the browser.
         #[arg(long)]
@@ -233,12 +264,12 @@ async fn batch_processing_end(slug: String) -> Result<()> {
     Ok(())
 }
 
-async fn current_exe() -> Result<PathBuf> {
+fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("could not resolve current_exe")
 }
 
 pub(crate) async fn ensure_daemon() -> Result<LockInfo> {
-    let exe = current_exe().await?;
+    let exe = current_exe()?;
     daemon::ensure_running(&exe).await
 }
 
@@ -387,6 +418,8 @@ async fn publish(
     let client = cli_http_client();
 
     let final_slug = if update {
+        // clap guarantees --slug is present alongside --update, so this is
+        // unreachable rather than a real runtime path.
         let target = slug
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--update requires --slug"))?;
@@ -396,13 +429,7 @@ async fn publish(
             .json(&body)
             .send()
             .await?;
-        if !resp.status().is_success() {
-            bail!(
-                "update failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            );
-        }
+        ensure_success(resp, "update").await?;
         target
     } else {
         let body = CreateBlueprintBody {
@@ -414,14 +441,10 @@ async fn publish(
             .json(&body)
             .send()
             .await?;
-        if !resp.status().is_success() {
-            bail!(
-                "publish failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            );
-        }
-        let out = resp.json::<CreateBlueprintResp>().await?;
+        let out = ensure_success(resp, "publish")
+            .await?
+            .json::<CreateBlueprintResp>()
+            .await?;
         out.slug
     };
 
@@ -441,14 +464,17 @@ async fn publish(
     println!("blueprint daemon at {}", base_url(&info));
     println!("Published as {}", url);
 
-    if !no_open {
-        let _ = open_browser(&url);
+    // Only claim to have opened a browser if the spawn actually worked —
+    // printing it unconditionally sent people looking for a window that was
+    // never going to appear (headless box, no xdg-open).
+    if !no_open && open_browser(&url) {
         println!("(opening in default browser)");
     }
     Ok(())
 }
 
-fn open_browser(url: &str) -> Result<()> {
+/// Returns whether a browser was actually launched.
+fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     let cmd = "open";
     #[cfg(target_os = "linux")]
@@ -456,11 +482,14 @@ fn open_browser(url: &str) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = url;
-        return Ok(());
+        false
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    std::process::Command::new(cmd).arg(url).spawn().ok();
-    Ok(())
+    std::process::Command::new(cmd)
+        .arg(url)
+        .spawn()
+        .inspect_err(|e| tracing::debug!(%e, "could not launch a browser"))
+        .is_ok()
 }
 
 async fn watch(slug: String, stream: bool) -> Result<()> {
@@ -478,9 +507,7 @@ async fn watch(slug: String, stream: bool) -> Result<()> {
         .timeout(Duration::from_secs(60 * 60 * 4))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        bail!("watch failed: {}", resp.status());
-    }
+    ensure_success(resp, "watch").await?;
     println!("Review complete.");
     Ok(())
 }
@@ -606,14 +633,7 @@ async fn comment(
             })
             .send()
             .await?;
-        if !resp.status().is_success() {
-            bail!(
-                "reply failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            );
-        }
-        let c: Comment = resp.json().await?;
+        let c: Comment = ensure_success(resp, "reply").await?.json().await?;
         println!("Added reply {} to {}", c.id, parent_id);
         return Ok(());
     }
@@ -641,7 +661,7 @@ async fn comment(
             slug
         );
     }
-    let (prefix, suffix) = context_around(&raw, &q);
+    let (prefix, suffix) = context_around(&stripped, &q);
     let selector = TextQuoteSelector {
         ty: "TextQuoteSelector".into(),
         exact: q,
@@ -668,30 +688,55 @@ async fn comment(
         })
         .send()
         .await?;
-    if !resp.status().is_success() {
-        bail!(
-            "comment failed: {} {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
-    let c: Comment = resp.json().await?;
+    let c: Comment = ensure_success(resp, "comment").await?.json().await?;
     println!("Added comment {}", c.id);
     Ok(())
 }
 
-/// Strip tags naively, then find the quote, returning ~32 chars of surrounding context.
-fn context_around(html: &str, quote: &str) -> (Option<String>, Option<String>) {
-    let text = strip_tags(html);
+/// How much surrounding text to record on each side of the quote, in bytes.
+/// A hint for re-anchoring, not an exact count — snapping to char boundaries can
+/// shrink it by a few bytes, which is fine.
+const CONTEXT_BYTES: usize = 32;
+
+/// Find the quote in already-stripped text, returning ~32 bytes of surrounding
+/// context. Takes the stripped text rather than the raw HTML because the caller
+/// has already paid for that pass.
+///
+/// Both offsets are snapped to char boundaries: an em-dash or emoji within
+/// `CONTEXT_BYTES` of the match — routine in a design doc — would otherwise put
+/// the slice index mid-codepoint and panic.
+fn context_around(text: &str, quote: &str) -> (Option<String>, Option<String>) {
     if let Some(idx) = text.find(quote) {
-        let pre_start = idx.saturating_sub(32);
-        let suf_end = (idx + quote.len() + 32).min(text.len());
+        let pre_start = floor_char_boundary(text, idx.saturating_sub(CONTEXT_BYTES));
+        let quote_end = idx + quote.len();
+        let suf_end = ceil_char_boundary(text, quote_end + CONTEXT_BYTES);
         let prefix = Some(text[pre_start..idx].to_string());
-        let suffix = Some(text[idx + quote.len()..suf_end].to_string());
+        let suffix = Some(text[quote_end..suf_end].to_string());
         (prefix, suffix)
     } else {
         (None, None)
     }
+}
+
+/// Largest char boundary `<= i`. (`str::floor_char_boundary` is still unstable.)
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest char boundary `>= i`, clamped to the end of the string.
+fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 fn strip_tags(html: &str) -> String {
@@ -715,9 +760,7 @@ async fn unpublish(slug: String) -> Result<()> {
         .delete(format!("{}/api/blueprints/{}", base_url(&info), slug))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        bail!("unpublish failed: {}", resp.status());
-    }
+    ensure_success(resp, "unpublish").await?;
     println!("Removed blueprint {}", slug);
 
     // Ask the daemon to stop *if* no blueprints remain. The check happens server-side
@@ -742,4 +785,41 @@ pub(crate) fn require_running() -> Result<LockInfo> {
     daemon::discover_running().ok_or_else(|| {
         anyhow::anyhow!("blueprint daemon is not running (try `blueprint publish` first)")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{context_around, parse_port};
+
+    /// The bug this guards: an em-dash within 32 bytes of the match used to put
+    /// the slice index mid-codepoint and panic. Design docs are full of them.
+    #[test]
+    fn context_survives_multibyte_neighbors() {
+        let text = "an em—dash and a curly ’quote’ precede TARGET and 😀 emoji follow — really";
+        let (prefix, suffix) = context_around(text, "TARGET");
+        assert!(prefix.expect("prefix").ends_with("precede "));
+        assert!(suffix.expect("suffix").starts_with(" and 😀"));
+    }
+
+    /// A multi-byte char straddling the exact 32-byte cut in both directions.
+    #[test]
+    fn context_snaps_to_char_boundaries_at_the_cut() {
+        // Padding chosen so the naive offset lands inside a 3-byte char.
+        let text = format!("{}…QUOTE…{}", "x".repeat(30), "y".repeat(30));
+        let (prefix, suffix) = context_around(&text, "QUOTE");
+        assert!(prefix.expect("prefix").ends_with('…'));
+        assert!(suffix.expect("suffix").starts_with('…'));
+    }
+
+    #[test]
+    fn context_is_none_when_the_quote_is_absent() {
+        assert_eq!(context_around("nothing here", "MISSING"), (None, None));
+    }
+
+    #[test]
+    fn port_zero_is_rejected() {
+        assert!(parse_port("0").is_err());
+        assert_eq!(parse_port("7321").unwrap(), 7321);
+        assert!(parse_port("notanumber").is_err());
+    }
 }
