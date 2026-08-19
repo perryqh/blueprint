@@ -269,6 +269,7 @@ pub async fn run_foreground(preferred_port: Option<u16>) -> Result<()> {
     };
     let state = AppState::with_auth(store, auth);
     let shutdown_notify = state.shutdown.clone();
+    spawn_session_sweeper(state.store.clone());
     let app = router(state);
 
     let env_port: Option<u16> = std::env::var("BLUEPRINT_PORT")
@@ -304,6 +305,28 @@ pub async fn run_foreground(preferred_port: Option<u16>) -> Result<()> {
     let result = server.await.context("axum serve");
     clear_lock_for_pid(info.pid);
     result
+}
+
+/// How often to drop expired session rows. Expired rows are already invisible
+/// to `load_session`, so this is housekeeping, not correctness — but a daemon
+/// that stays up for weeks would otherwise accumulate a row per abandoned
+/// login until the next restart.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24);
+
+/// Sweep expired sessions now, then once a day for as long as the daemon lives.
+/// A detached task rather than work inside `router()`: building a router
+/// shouldn't write to the database, and every integration test builds one.
+fn spawn_session_sweeper(store: Arc<Store>) {
+    tokio::spawn(async move {
+        loop {
+            match store.delete_expired_sessions() {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(n, "swept expired sessions"),
+                Err(e) => tracing::warn!(%e, "could not sweep expired sessions"),
+            }
+            tokio::time::sleep(SESSION_SWEEP_INTERVAL).await;
+        }
+    });
 }
 
 fn now_secs() -> u64 {

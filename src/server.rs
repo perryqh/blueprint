@@ -200,10 +200,11 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    use tower_sessions::{
-        Expiry, MemoryStore, SessionManagerLayer, cookie::SameSite, cookie::time::Duration,
-    };
-    let session_store = MemoryStore::default();
+    use tower_sessions::{Expiry, SessionManagerLayer, cookie::SameSite, cookie::time::Duration};
+    // On disk, not in memory: the daemon restarts often enough that a
+    // process-local store broke the OAuth handshake outright. See
+    // `crate::session_store`.
+    let session_store = crate::session_store::SqliteSessionStore::new(state.store.clone());
     let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(false) // localhost = http
         .with_same_site(SameSite::Lax)

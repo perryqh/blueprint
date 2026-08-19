@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
         .try_init();
 
     // Pulls ~/.blueprint/env into the process environment (GitHub OAuth creds,
-    // SESSION_SECRET, OAUTH_CALLBACK_URL, BLUEPRINT_PORT). Missing file = auth disabled.
+    // OAUTH_CALLBACK_URL, BLUEPRINT_PORT). Missing file = auth disabled.
     blueprint::auth::load_env_file()?;
 
     let args = cli::Cli::parse();

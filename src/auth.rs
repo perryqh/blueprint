@@ -1,9 +1,10 @@
 //! GitHub OAuth + session wiring.
 //!
 //! Reads config from environment variables (sourced from ~/.blueprint/env on
-//! daemon startup). Single tower-sessions MemoryStore for cookie-backed sessions
-//! — fine for local single-instance use. The user identity in session is just
-//! the row id of the `users` table.
+//! daemon startup). Cookie-backed sessions are persisted in SQLite via
+//! `crate::session_store` — the daemon restarts too often for a process-local
+//! store to hold a login, let alone an in-flight OAuth handshake. The user
+//! identity in session is just the row id of the `users` table.
 
 use crate::error::AppError;
 use crate::server::AppState;
@@ -119,14 +120,6 @@ fn ensure_cli_token() -> String {
         let _ = writeln!(f, "{token}");
     }
     token
-}
-
-/// Read SESSION_SECRET from env. Used only to detect when auth has been configured
-/// (the secret value itself is not consumed — tower-sessions signs cookies with its
-/// internal HMAC key derived from the store).
-#[allow(dead_code)]
-pub fn session_secret_configured() -> bool {
-    std::env::var("SESSION_SECRET").is_ok()
 }
 
 /// Try to load ~/.blueprint/env into process env. Quietly ignores a missing file
@@ -347,9 +340,23 @@ pub async fn callback(
     let expected: Option<String> = session.get(SESSION_OAUTH_STATE).await.unwrap_or(None);
     match expected {
         Some(s) if s == params.state => {
+            // Consumed on the happy path. Note the removal only reaches the
+            // store if this request ends in a non-5xx response — tower-sessions
+            // deliberately skips saving on server errors. So if the token
+            // exchange below fails, the nonce survives and the user can retry
+            // the whole round trip; that's the behavior we want, not an
+            // oversight, but it does mean the nonce isn't single-use when the
+            // exchange breaks.
             session.remove::<String>(SESSION_OAUTH_STATE).await.ok();
         }
-        _ => return Err(AppError::BadRequest("state mismatch or missing".into())),
+        // Present but different: a replayed, stale, or forged callback. Refuse
+        // it and don't invite a retry.
+        Some(_) => return Err(AppError::BadRequest("state mismatch".into())),
+        // No nonce at all — this session never started a login. Cookies
+        // cleared mid-flow, or the session expired while the consent screen
+        // sat open. Nothing is authenticated either way, and a fresh /login
+        // mints a new nonce, so hand back a way forward instead of a dead end.
+        None => return Ok(restart_login_page()),
     }
 
     // Exchange the code for an access token.
@@ -397,6 +404,32 @@ pub async fn callback(
         .flatten();
     let target = redirect_to.unwrap_or_else(|| "/".into());
     Ok(Redirect::to(&target).into_response())
+}
+
+/// 400 page for a callback whose session carries no login attempt. Deliberately
+/// a one-click restart rather than a bare error string — the old plain-text
+/// `state mismatch or missing` left the browser on a black dead-end page with
+/// no hint that retrying would work.
+fn restart_login_page() -> Response {
+    const BODY: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>Sign-in expired</title>
+<style>
+  body { background:#111; color:#eee; font:15px/1.6 -apple-system, system-ui, sans-serif;
+         display:grid; place-content:center; height:100vh; margin:0; text-align:center }
+  a { color:#7aa2f7 }
+</style>
+<h1>Sign-in expired</h1>
+<p>This sign-in attempt is no longer valid — it was started by a different
+   browser session, or it sat too long before finishing.</p>
+<p><a href="/login">Sign in with GitHub again</a></p>
+"#;
+    (
+        StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        BODY,
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]

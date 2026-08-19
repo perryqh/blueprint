@@ -48,9 +48,14 @@ To enable OAuth and the owner role, populate `~/.blueprint/env`:
 # ~/.blueprint/env
 GITHUB_CLIENT_ID=Iv1.xxxxxxxxxxxxxxxx
 GITHUB_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-SESSION_SECRET=any-long-random-string
 BLUEPRINT_OWNER_GITHUB_LOGIN=your-github-login   # case-insensitive
 ```
+
+Sessions are cookie-backed and stored in `~/.blueprint/blueprints.db` (mode
+`0600` — the session id is a bearer credential, so the file is owner-only).
+There is no `SESSION_SECRET`: nothing signs the cookie, the random session id
+*is* the secret. Sessions survive a daemon restart, which is what keeps the
+OAuth round-trip and the owner role intact when the daemon respawns mid-flow.
 
 `BLUEPRINT_OWNER_GITHUB_LOGIN` is **optional**. If you set it without the two `GITHUB_*` vars, the daemon prints a startup WARN — owner-role assignment depends on the OAuth session, so the env var is dead config without it. Same the other way: enable OAuth without setting the owner, and you'll get a different WARN noting that no comment will trip a plan edit.
 

@@ -127,6 +127,13 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // Owner-only, before WAL exists. A tower-sessions id is a bearer
+        // credential — there's no signing and no server-side secret, so
+        // whoever can read a session row can impersonate that user. The
+        // database therefore needs the same 0600 that `ensure_cli_token`
+        // already gives the CLI token. Done before `journal_mode = WAL` so
+        // the `-wal` and `-shm` files, which carry the same rows, inherit it.
+        restrict_to_owner(path)?;
         conn.execute_batch(
             r#"
             PRAGMA foreign_keys = ON;
@@ -177,6 +184,21 @@ impl Store {
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
             );
+
+            -- Browser sessions, keyed by the opaque cookie id. `record` is the
+            -- serialized tower-sessions Record (its own JSON shape, opaque to
+            -- us); `expires_at` is that record's expiry lifted into a column so
+            -- expiry can be enforced and swept in SQL. This is on disk rather
+            -- than in memory because the daemon is short-lived by design — see
+            -- `crate::session_store`.
+            CREATE TABLE IF NOT EXISTS sessions (
+              id         TEXT PRIMARY KEY,
+              record     TEXT NOT NULL,
+              expires_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
+              ON sessions(expires_at);
             "#,
         )?;
 
@@ -334,6 +356,74 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    // -----------------------------------------------------------------------
+    // Session records. The serialized-record shape belongs to tower-sessions;
+    // these are deliberately dumb key/value accessors so `crate::session_store`
+    // owns all of the encoding. `expires_at` is a wall-clock ms deadline.
+    // -----------------------------------------------------------------------
+
+    /// Insert a brand-new session. Returns `false` if `id` was already taken,
+    /// which is the caller's signal to re-roll the id rather than clobber a
+    /// live session belonging to someone else.
+    pub fn insert_session(
+        &self,
+        id: &str,
+        record: &str,
+        expires_at: i64,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, record, expires_at) VALUES (?1, ?2, ?3)",
+            params![id, record, expires_at],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Write a session, creating it if absent. Used for updates to a session
+    /// that already exists (a fresh one goes through `insert_session`).
+    pub fn save_session(&self, id: &str, record: &str, expires_at: i64) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, record, expires_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               record = excluded.record,
+               expires_at = excluded.expires_at",
+            params![id, record, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Load a session's serialized record, treating an expired row as absent.
+    pub fn load_session(&self, id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT record FROM sessions WHERE id = ?1 AND expires_at > ?2",
+                params![id, now_ms()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn delete_session(&self, id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Drop every session past its expiry. Called once at daemon startup —
+    /// expired rows are already invisible to `load_session`, so this is only
+    /// housekeeping to keep the table from growing without bound.
+    pub fn delete_expired_sessions(&self) -> Result<usize, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ?1",
+            params![now_ms()],
+        )?;
+        Ok(rows)
     }
 
     pub fn insert_blueprint(
@@ -866,6 +956,46 @@ fn read_version(conn: &Connection, slug: &str) -> Result<Option<i64>, AppError> 
         .optional()?)
 }
 
+/// Clamp the database — and its WAL sidecars, if they already exist — to
+/// owner-only. Covers the sidecars explicitly rather than relying on SQLite to
+/// inherit the mode, so a database created before this change gets fixed up on
+/// the next open instead of staying readable.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    for p in [
+        path.to_path_buf(),
+        sidecar(path, "-wal"),
+        sidecar(path, "-shm"),
+    ] {
+        // A sidecar that isn't there yet inherits the mode we just set on the
+        // database, so a missing file is nothing to fix.
+        if !p.exists() {
+            continue;
+        }
+        let mut perms = std::fs::metadata(&p)?.permissions();
+        if perms.mode() & 0o077 != 0 {
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&p, perms)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> Result<(), AppError> {
+    Ok(())
+}
+
+/// `foo.db` + `-wal` → `foo.db-wal`, matching how SQLite names its sidecars
+/// (a suffix on the full filename, not a replaced extension).
+#[cfg(unix)]
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
 fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
     let sel_json: String = r.get(4)?;
     let selector: TextQuoteSelector = serde_json::from_str(&sel_json).map_err(|e| {
@@ -898,4 +1028,47 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The database holds session rows, and a session id is a bearer credential.
+    /// It — and the WAL sidecars carrying the same rows — must not be readable
+    /// by other local users.
+    #[test]
+    fn database_and_wal_sidecars_are_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("blueprints.db");
+        let store = Store::open(&db).unwrap();
+        // Force the WAL sidecars into existence.
+        store.save_session("id", "{}", now_ms() + 60_000).unwrap();
+
+        assert_eq!(mode_of(&db), 0o600, "database should be owner-only");
+        for suffix in ["-wal", "-shm"] {
+            let side = sidecar(&db, suffix);
+            assert!(side.exists(), "expected {suffix} to exist");
+            assert_eq!(mode_of(&side), 0o600, "{suffix} should be owner-only");
+        }
+    }
+
+    /// A database created before sessions moved to disk is group/world-readable.
+    /// Opening it has to tighten it rather than leave the old mode in place.
+    #[test]
+    fn open_tightens_a_preexisting_world_readable_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("blueprints.db");
+        drop(Store::open(&db).unwrap());
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&db), 0o644, "precondition");
+
+        let _store = Store::open(&db).unwrap();
+        assert_eq!(mode_of(&db), 0o600);
+    }
 }
