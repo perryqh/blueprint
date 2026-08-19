@@ -59,13 +59,17 @@ async fn finish_clicked_with_no_waiter_is_claimed_by_a_later_wait() {
 /// One click must be claimed by exactly one of several parked waiters. The
 /// others get nothing — a single finish is not a broadcast to every listener.
 ///
-/// What counts as "got nothing" changed when `/wait` grew an upper bound: a
-/// non-claiming waiter now answers 200 with `finished_at: null` ("nothing yet,
-/// ask again") instead of parking until the client gave up. So the claim can no
-/// longer be inferred from the status code — this counts non-null timestamps,
-/// which is the invariant that actually matters and is a sharper assertion than
-/// the old one either way. A loser that erroneously reported a *timestamp* used
-/// to be indistinguishable from a loser that timed out.
+/// "Nothing" means *still parked*, not "answered with null". A waiter that loses
+/// the race keeps waiting for the *next* click, which is the whole point of a
+/// durable latch: two `blueprint watch` processes on one slug shouldn't both end
+/// their round on one reviewer click. `FINISH_WAIT_TIMEOUT` is an hour-long
+/// safety valve for dead clients, not a "nothing yet" reply — so a loser is only
+/// observable here as a client that gave up first.
+///
+/// Both halves of that are asserted, because each alone is satisfiable by a bug:
+/// counting claims alone would pass if every waiter claimed and two happened to
+/// error for unrelated reasons, and checking for timeouts alone would pass if
+/// nobody claimed at all.
 #[tokio::test]
 async fn one_finish_is_claimed_by_exactly_one_of_several_parked_waiters() {
     let s = spawn().await;
@@ -79,12 +83,18 @@ async fn one_finish_is_claimed_by_exactly_one_of_several_parked_waiters() {
             tokio::spawn(async move {
                 let r = reqwest::Client::new()
                     .get(format!("{base}/api/blueprints/p/wait"))
-                    .timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_millis(600))
                     .send()
-                    .await
-                    .expect("a parked /wait must answer, not error");
-                assert_eq!(r.status(), 200);
-                r.json::<Value>().await.unwrap()["finished_at"].as_i64()
+                    .await;
+                match r {
+                    Ok(resp) => {
+                        assert_eq!(resp.status(), 200);
+                        Ok(resp.json::<Value>().await.unwrap()["finished_at"].as_i64())
+                    }
+                    // Carry whether it was a timeout so the caller can tell
+                    // "still parked" from "the server broke".
+                    Err(e) => Err(e.is_timeout()),
+                }
             })
         })
         .collect();
@@ -98,16 +108,31 @@ async fn one_finish_is_claimed_by_exactly_one_of_several_parked_waiters() {
     let finished_at = finish(&http, &s.base, "p").await;
 
     let mut claims = Vec::new();
+    let mut still_parked = 0;
     for w in waiters {
-        if let Some(ts) = w.await.unwrap() {
-            claims.push(ts);
+        match w.await.unwrap() {
+            Ok(Some(ts)) => claims.push(ts),
+            Ok(None) => panic!(
+                "a waiter answered `finished_at: null` before the hour-long safety \
+                 valve — a loser must keep waiting for the next click, not report \
+                 the round over"
+            ),
+            Err(true) => still_parked += 1,
+            Err(false) => {
+                panic!("a parked /wait failed for a reason other than the client timeout")
+            }
         }
     }
+
     assert_eq!(
         claims,
         vec![finished_at],
         "exactly one waiter must claim the finish, and it must report the \
          timestamp the click wrote"
+    );
+    assert_eq!(
+        still_parked, 2,
+        "the two losers must remain parked, waiting for the next click"
     );
 }
 
