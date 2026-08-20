@@ -6,8 +6,41 @@
 // elements (`<em>`, `<code>`, a `<a>` mid-sentence). Offsets are therefore
 // indices into that flattened string, and `highlightQuote` walks the text nodes
 // a second time to convert an offset pair back into a Range.
+//
+// Deciding *which* occurrence of a quote the selector meant no longer lives
+// here: it's `resolveQuote` in the blueprint-anchor crate, compiled to wasm, so
+// the daemon and the browser share one implementation instead of keeping two
+// copies in step by hand. What stays is everything that genuinely needs a DOM —
+// TreeWalker mapping, Range construction, span wrapping.
 
-const CONTEXT_CHARS = 32;
+import init, { resolveQuote, contextUnits } from './pkg/anchor.js';
+
+let ready = null;
+
+// Load the wasm module. Idempotent, so every entry point can await it without
+// coordinating; `app.js` does so once at boot, before the first render.
+//
+// `wasm` is an escape hatch for tests, which have no fetch-able URL and pass the
+// bytes straight in. Left undefined, the glue fetches `anchor_bg.wasm` relative
+// to its own module URL — /static/pkg/ in the daemon.
+export function initAnchoring(wasm) {
+  ready ??= init(wasm === undefined ? undefined : { module_or_path: wasm });
+  return ready;
+}
+
+// Context has to cross into wasm as UTF-16 code units, not as a string.
+//
+// The context window is a fixed number of code units, so it can bisect a
+// surrogate pair and leave a lone surrogate at the edge of the recorded prefix —
+// which has no UTF-8 encoding, so a string boundary would silently rewrite it to
+// U+FFFD and the prefix would stop matching. Empty and absent both mean "no
+// context recorded", which disables that half of disambiguation.
+function codeUnits(s) {
+  if (!s) return undefined;
+  const a = new Uint16Array(s.length);
+  for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+  return a;
+}
 
 // Flattened text of `root`, in document order. Must stay in lockstep with the
 // walker in `highlightQuote` — both use SHOW_TEXT with no filter, so the same
@@ -45,28 +78,48 @@ export function captureSelector(sel, body) {
   const before = textBefore(body, range.startContainer, range.startOffset);
   const full = wholeText(body);
   const start = before.length;
-  const prefix = full.slice(Math.max(0, start - CONTEXT_CHARS), start);
-  const suffix = full.slice(start + exact.length, start + exact.length + CONTEXT_CHARS);
+  // Window width comes from the Rust side rather than a local constant: capture
+  // and comparison have to agree on it, and two copies of a "32" are exactly how
+  // they'd drift apart for long prefixes.
+  const win = contextUnits();
+  const prefix = full.slice(Math.max(0, start - win), start);
+  const suffix = full.slice(start + exact.length, start + exact.length + win);
   return { type: 'TextQuoteSelector', exact, prefix, suffix };
 }
 
 // Resolve `selector` against `doc` and wrap every matching run in a highlight
-// span. Returns false when the quote no longer exists — the caller renders that
-// as "drifted".
+// span.
+//
+// Returns `{ anchored, confident }`:
+//   anchored  — false when the quote no longer exists anywhere, or the Range
+//               couldn't be built. The caller renders that as "drifted".
+//   confident — false when the quote was found but *no* occurrence agreed with
+//               the recorded prefix/suffix, so this is merely the first hit and
+//               probably the wrong paragraph. Only meaningful when anchored.
+//
+// The second field is what the old bare-index return could not express: a
+// context-confirmed match and a blind fallback were indistinguishable, so a
+// comment silently attached to text the reviewer never selected.
 //
 // `onClick` is invoked with the quote when a highlight span is clicked; passed
 // in rather than imported so this module stays free of app state.
 export function highlightQuote(doc, selector, quote, onClick) {
+  const miss = { anchored: false, confident: true };
   const root = doc.body;
-  if (!root) return false;
+  if (!root) return miss;
   const text = wholeText(root);
-  const bestIdx = findQuoteIndex(text, selector, quote);
-  if (bestIdx === -1) return false;
+  const hit = resolveQuote(text, quote, codeUnits(selector.prefix), codeUnits(selector.suffix));
+  if (!hit) return miss;
+  // Read the fields out and release the wasm-side object rather than waiting for
+  // the glue's FinalizationRegistry — this runs once per comment per render.
+  const targetStart = hit.start;
+  const targetEnd = hit.end;
+  const confident = !hit.fallback;
+  hit.free();
+  const found = { anchored: true, confident };
   const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   let consumed = 0;
   let startNode = null, startOffset = 0, endNode = null, endOffset = 0;
-  const targetStart = bestIdx;
-  const targetEnd = bestIdx + quote.length;
   while (walker.nextNode()) {
     const n = walker.currentNode;
     const len = n.textContent.length;
@@ -81,45 +134,16 @@ export function highlightQuote(doc, selector, quote, onClick) {
     }
     consumed += len;
   }
-  if (!startNode || !endNode) return false;
+  if (!startNode || !endNode) return miss;
   try {
     const range = doc.createRange();
     range.setStart(startNode, startOffset);
     range.setEnd(endNode, endOffset);
     wrapRange(range, doc, quote, onClick);
-    return true;
+    return found;
   } catch (e) {
-    return false;
+    return miss;
   }
-}
-
-// Pick which occurrence of `quote` the selector meant. Walks every hit and
-// keeps the first whose surrounding text agrees with prefix/suffix.
-//
-// Known-wrong fallback: when no occurrence matches the context we return the
-// first `indexOf` hit anyway rather than failing. That silently anchors to the
-// wrong paragraph, but the alternative — reporting drift on text that plainly
-// still exists — tested worse, so the wrong-but-visible anchor stays.
-//
-// Note both context checks are skipped when the corresponding field is falsy,
-// which covers `undefined` (the server omits absent context via
-// skip_serializing_if) and `''` (a selection at the very start of the document
-// has no prefix). Either way disambiguation is off and the first hit wins.
-export function findQuoteIndex(text, selector, quote) {
-  let searchFrom = 0;
-  while (true) {
-    const found = text.indexOf(quote, searchFrom);
-    if (found === -1) break;
-    const before = text.slice(Math.max(0, found - CONTEXT_CHARS), found);
-    const after = text.slice(found + quote.length, found + quote.length + CONTEXT_CHARS);
-    const prefixOK = !selector.prefix
-      || before.endsWith(selector.prefix.slice(-Math.min(CONTEXT_CHARS, selector.prefix.length)));
-    const suffixOK = !selector.suffix
-      || after.startsWith(selector.suffix.slice(0, Math.min(CONTEXT_CHARS, selector.suffix.length)));
-    if (prefixOK && suffixOK) return found;
-    searchFrom = found + 1;
-  }
-  return text.indexOf(quote);
 }
 
 // Wrap `range` in one or more highlight spans. `surroundContents` is tried

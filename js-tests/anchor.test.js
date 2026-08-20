@@ -1,22 +1,36 @@
-// Table-driven tests for the text-anchoring algorithm (frontend/anchor.js).
+// Tests for the DOM half of text anchoring (frontend/anchor.js).
 //
 // Anchoring is the load-bearing piece of the whole product: get it wrong and a
 // comment either lands on the wrong paragraph or is reported as "drifted" when
-// the text is plainly still there. It had zero coverage in either language
-// before this file.
+// the text is plainly still there.
 //
-// `findQuoteIndex` is tested directly on strings (it's pure), and
-// `highlightQuote` is tested against real jsdom documents so the text-node
-// walking and Range construction are exercised too.
+// Choosing *which* occurrence a selector meant now lives in the
+// `blueprint-anchor` crate, so the table-driven cases that used to live here —
+// duplicate quotes, window edges, surrogate pairs, the known-wrong fallback —
+// are `#[test]`s in anchor/src/lib.rs. What remains is what needs a DOM:
+// flattening text across elements, mapping offsets back onto text nodes, and
+// building the highlight Ranges. Those exercise the real wasm module rather than
+// a stand-in, so this file also covers the JS↔wasm boundary.
 
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
-  findQuoteIndex,
+  initAnchoring,
   highlightQuote,
   wholeText,
   textBefore,
   captureSelector,
 } from '../frontend/anchor.js';
+
+// The wasm glue defaults to `fetch`ing its sibling .wasm relative to its own
+// module URL, which node has no answer for — so hand it the bytes directly.
+// Same artifact the browser loads, so the boundary under test is the real one.
+// Resolved from the vitest root rather than `import.meta.url`: the jsdom
+// environment reports module URLs as http://, which `readFileSync` rejects.
+beforeAll(async () => {
+  await initAnchoring(readFileSync(resolve(process.cwd(), 'frontend/pkg/anchor_bg.wasm')));
+});
 
 // Build a document whose body is `html`. jsdom is the environment (see
 // vitest.config.js), so `document.implementation` gives us isolated docs that
@@ -41,146 +55,8 @@ function highlightedText(doc) {
     .join('');
 }
 
-describe('findQuoteIndex', () => {
-  // Each case: the haystack, the selector, and the offset we expect to win.
-  const cases = [
-    {
-      name: 'unique quote — context is redundant but must not break the match',
-      text: 'alpha beta gamma',
-      selector: { exact: 'beta', prefix: 'alpha ', suffix: ' gamma' },
-      expected: 6,
-    },
-    {
-      name: 'unique quote with no context at all',
-      text: 'alpha beta gamma',
-      selector: { exact: 'beta' },
-      expected: 6,
-    },
-    {
-      name: 'duplicate quotes — prefix disambiguates to the second',
-      text: 'the cat sat. the dog sat. done',
-      selector: { exact: 'sat', prefix: 'the dog ' },
-      expected: 21,
-    },
-    {
-      name: 'duplicate quotes — suffix disambiguates to the second',
-      text: 'x: value one. x: value two.',
-      selector: { exact: 'x: value', suffix: ' two.' },
-      expected: 14,
-    },
-    {
-      name: 'duplicate quotes — prefix+suffix together pick the middle one',
-      text: 'a ref b. c ref d. e ref f.',
-      selector: { exact: 'ref', prefix: 'c ', suffix: ' d.' },
-      expected: 11,
-    },
-    {
-      name: 'prefix longer than the 32-char window still matches on its tail',
-      // Only the last 32 chars of the prefix are compared, because that's all
-      // `captureSelector` recorded and all the haystack slice provides.
-      text: 'x'.repeat(50) + 'TARGET tail',
-      selector: { exact: 'TARGET', prefix: 'y'.repeat(20) + 'x'.repeat(32) },
-      expected: 50,
-    },
-    {
-      name: 'no match — quote is simply gone',
-      text: 'nothing to see here',
-      selector: { exact: 'absent', prefix: 'no', suffix: 'pe' },
-      expected: -1,
-    },
-  ];
-
-  for (const c of cases) {
-    it(c.name, () => {
-      expect(findQuoteIndex(c.text, sel(c.selector), c.selector.exact)).toBe(c.expected);
-    });
-  }
-
-  // KNOWN-WRONG BEHAVIOUR, asserted deliberately so a future change is visible.
-  //
-  // When several occurrences exist and *none* of them agrees with the recorded
-  // prefix/suffix (e.g. the plan was edited around the quote), the loop falls
-  // through and `return text.indexOf(quote)` hands back the FIRST occurrence.
-  // That is very likely the wrong one — the user's comment was anchored to some
-  // other instance. The alternative (returning -1 and flagging drift) was judged
-  // worse in practice, so the wrong-but-visible anchor is intentional. If this
-  // test starts failing, someone changed that trade-off on purpose.
-  it('duplicate quotes with FAILING disambiguation falls back to the first hit (known-wrong)', () => {
-    const text = 'one HIT two HIT three HIT four';
-    // Context that matches none of the three occurrences.
-    const s = sel({ exact: 'HIT', prefix: 'ZZZZ ', suffix: ' QQQQ' });
-    expect(findQuoteIndex(text, s, 'HIT')).toBe(4); // first occurrence
-    // For contrast: correct disambiguation would have picked the third.
-    expect(text.indexOf('HIT', 18)).toBe(22);
-  });
-
-  // The Rust test harness (tests/e2e.rs, tests/concurrent.rs) builds nearly
-  // every selector as {type, exact} with no context, and src/selector.rs uses
-  // `skip_serializing_if = "Option::is_none"` so the fields come back *absent*
-  // rather than empty. Either way `!selector.prefix` is truthy and
-  // disambiguation is skipped entirely — so the whole prefix/suffix branch that
-  // this algorithm exists for is never exercised by the Rust suite.
-  it('empty-string prefix disables prefix disambiguation (so first hit wins)', () => {
-    const text = 'aa ZZ bb ZZ cc';
-    // A selection at offset 0 legitimately has prefix '', which is falsy — the
-    // same code path as "no prefix recorded".
-    const s = sel({ exact: 'ZZ', prefix: '', suffix: ' bb' });
-    expect(findQuoteIndex(text, s, 'ZZ')).toBe(3);
-    // Suffix alone still works; it's only the empty field that opts out.
-    const s2 = sel({ exact: 'ZZ', prefix: '', suffix: ' cc' });
-    expect(findQuoteIndex(text, s2, 'ZZ')).toBe(9);
-  });
-
-  it('undefined prefix (server omitted it) behaves the same as empty', () => {
-    const text = 'aa ZZ bb ZZ cc';
-    const s = sel({ exact: 'ZZ', suffix: ' cc' });
-    expect(s.prefix).toBeUndefined();
-    expect(findQuoteIndex(text, s, 'ZZ')).toBe(9);
-  });
-
-  // Multi-byte characters make the 32-char context window a *code-unit* window,
-  // not a character one: JS string indices are UTF-16 code units, so an emoji
-  // (surrogate pair) counts as 2 and can be sliced in half at the boundary.
-  describe('multi-byte characters near the 32-char window edge', () => {
-    it('astral-plane prefix is compared by code units and still matches', () => {
-      // 16 emoji = 32 UTF-16 code units, exactly filling the window.
-      const emoji = '🎯'.repeat(16);
-      const text = `lead ${emoji}TARGET trail`;
-      const start = text.indexOf('TARGET');
-      const fullPrefix = text.slice(0, start);
-      expect(fullPrefix.length).toBeGreaterThan(32);
-      // captureSelector would have recorded only the last 32 code units.
-      const recorded = fullPrefix.slice(-32);
-      expect(findQuoteIndex(text, sel({ exact: 'TARGET', prefix: recorded }), 'TARGET'))
-        .toBe(start);
-    });
-
-    it('a surrogate pair split by the window edge still anchors', () => {
-      // 33 code units of prefix means the 32-unit window starts mid-emoji,
-      // leaving a lone low surrogate at the front of both the recorded prefix
-      // and the haystack slice. They're compared as equal code units, so
-      // endsWith still succeeds — the match must not be lost to mojibake.
-      const text = 'z' + '🎯'.repeat(16) + 'TARGET';
-      const start = text.indexOf('TARGET');
-      expect(start).toBe(33);
-      const recorded = text.slice(0, start).slice(-32);
-      expect(recorded.length).toBe(32);
-      expect(findQuoteIndex(text, sel({ exact: 'TARGET', prefix: recorded }), 'TARGET'))
-        .toBe(start);
-    });
-
-    it('combining marks are matched as written, not normalized', () => {
-      // 'é' as e + U+0301 is two code units and does NOT equal precomposed 'é'.
-      // The algorithm does no Unicode normalization, so a selector recorded in
-      // one form won't match text stored in the other. Asserted so the
-      // limitation is documented rather than discovered.
-      const decomposed = 'café menu';
-      const precomposed = 'café menu';
-      expect(findQuoteIndex(decomposed, sel({ exact: 'café' }), 'café')).toBe(-1);
-      expect(findQuoteIndex(precomposed, sel({ exact: 'café' }), 'café')).toBe(0);
-    });
-  });
-});
+// Anchored and context-confirmed — the ordinary success case.
+const CONFIDENT = { anchored: true, confident: true };
 
 describe('wholeText / textBefore', () => {
   it('flattens text across element boundaries in document order', () => {
@@ -211,7 +87,7 @@ describe('wholeText / textBefore', () => {
 });
 
 describe('captureSelector', () => {
-  it('records 32 chars of context on each side', () => {
+  it('records 32 code units of context on each side', () => {
     const doc = docFrom(`<p>${'a'.repeat(40)}QUOTE${'b'.repeat(40)}</p>`);
     const textNode = doc.querySelector('p').firstChild;
     const range = doc.createRange();
@@ -220,6 +96,8 @@ describe('captureSelector', () => {
     range.setEnd(textNode, start + 5);
     const fakeSel = { getRangeAt: () => range, toString: () => 'QUOTE' };
     const s = captureSelector(fakeSel, doc.body);
+    // The width comes from the Rust side via `contextUnits()`, so this also
+    // asserts capture and comparison still agree about it.
     expect(s).toEqual({
       type: 'TextQuoteSelector',
       exact: 'QUOTE',
@@ -244,8 +122,8 @@ describe('captureSelector', () => {
     range.setStart(textNode, 0);
     range.setEnd(textNode, 5);
     const fakeSel = { getRangeAt: () => range, toString: () => 'start' };
-    // This is the '' case above: real, reachable, and it silently turns off
-    // prefix disambiguation for the resulting selector.
+    // Real and reachable, and it silently turns off prefix disambiguation for
+    // the resulting selector — see the Rust cases for what that then does.
     expect(captureSelector(fakeSel, doc.body).prefix).toBe('');
   });
 });
@@ -253,7 +131,7 @@ describe('captureSelector', () => {
 describe('highlightQuote', () => {
   it('wraps a unique quote inside a single text node', () => {
     const doc = docFrom('<p>alpha beta gamma</p>');
-    expect(highlightQuote(doc, sel({ exact: 'beta', prefix: 'alpha ' }), 'beta')).toBe(true);
+    expect(highlightQuote(doc, sel({ exact: 'beta', prefix: 'alpha ' }), 'beta')).toEqual(CONFIDENT);
     const spans = doc.querySelectorAll('span[data-ps-hl]');
     expect(spans.length).toBe(1);
     expect(spans[0].textContent).toBe('beta');
@@ -265,7 +143,7 @@ describe('highlightQuote', () => {
   it('spans element boundaries across <em>/<strong>', () => {
     const doc = docFrom('<p>Hello <em>brave</em> <strong>new</strong> world</p>');
     const quote = 'brave new';
-    expect(highlightQuote(doc, sel({ exact: quote, prefix: 'Hello ' }), quote)).toBe(true);
+    expect(highlightQuote(doc, sel({ exact: quote, prefix: 'Hello ' }), quote)).toEqual(CONFIDENT);
     // One span per contributing text node: "brave", " ", "new".
     expect(highlightedText(doc)).toBe(quote);
     expect(doc.querySelectorAll('span[data-ps-hl]').length).toBeGreaterThan(1);
@@ -280,29 +158,47 @@ describe('highlightQuote', () => {
     // precisely where it ends, so start/endOffset are 0 and node length —
     // the boundary conditions in the walker's `consumed + len` arithmetic.
     const doc = docFrom('<p>ab<em>cd</em>ef</p>');
-    expect(highlightQuote(doc, sel({ exact: 'cd', prefix: 'ab', suffix: 'ef' }), 'cd')).toBe(true);
+    expect(highlightQuote(doc, sel({ exact: 'cd', prefix: 'ab', suffix: 'ef' }), 'cd'))
+      .toEqual(CONFIDENT);
     expect(highlightedText(doc)).toBe('cd');
     expect(wholeText(doc.body)).toBe('abcdef');
   });
 
   it('anchors a quote ending exactly at the document end', () => {
     const doc = docFrom('<p>lead tail</p>');
-    expect(highlightQuote(doc, sel({ exact: 'tail', prefix: 'lead ', suffix: '' }), 'tail')).toBe(true);
+    expect(highlightQuote(doc, sel({ exact: 'tail', prefix: 'lead ', suffix: '' }), 'tail'))
+      .toEqual(CONFIDENT);
     expect(highlightedText(doc)).toBe('tail');
   });
 
-  it('returns false and wraps nothing when the quote is gone', () => {
+  it('reports not-anchored and wraps nothing when the quote is gone', () => {
     const doc = docFrom('<p>the plan changed</p>');
-    expect(highlightQuote(doc, sel({ exact: 'deleted sentence' }), 'deleted sentence')).toBe(false);
+    const r = highlightQuote(doc, sel({ exact: 'deleted sentence' }), 'deleted sentence');
+    expect(r.anchored).toBe(false);
     expect(doc.querySelectorAll('span[data-ps-hl]').length).toBe(0);
   });
 
   it('picks the context-matching occurrence among duplicates', () => {
     const doc = docFrom('<p>the cat sat. the dog sat. done</p>');
-    expect(highlightQuote(doc, sel({ exact: 'sat', prefix: 'the dog ' }), 'sat')).toBe(true);
+    expect(highlightQuote(doc, sel({ exact: 'sat', prefix: 'the dog ' }), 'sat'))
+      .toEqual(CONFIDENT);
     const span = doc.querySelector('span[data-ps-hl]');
     // The highlighted "sat" must be the one after "dog", not after "cat".
     expect(span.previousSibling.textContent.endsWith('the dog ')).toBe(true);
+  });
+
+  // The headline case from issue #6, now observable. The quote is still present
+  // but no occurrence agrees with the recorded context, so the highlight lands on
+  // the first hit — the wrong one. It still anchors (that trade-off is
+  // deliberate), but `confident: false` is what lets the sidebar say so instead
+  // of presenting it as a clean match.
+  it('flags a fallback match as not confident', () => {
+    const doc = docFrom('<p>one HIT two HIT three HIT four</p>');
+    const r = highlightQuote(doc, sel({ exact: 'HIT', prefix: 'ZZZZ ', suffix: ' QQQQ' }), 'HIT');
+    expect(r).toEqual({ anchored: true, confident: false });
+    // And it really did take the first occurrence.
+    const span = doc.querySelector('span[data-ps-hl]');
+    expect(span.previousSibling.textContent).toBe('one ');
   });
 
   it('invokes onClick with the quote when a highlight is activated', () => {
@@ -318,5 +214,17 @@ describe('highlightQuote', () => {
     span.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     span.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     expect(seen).toEqual(['beta', 'beta']);
+  });
+
+  // Astral-plane text end to end through the wasm boundary: the offsets the
+  // module returns are UTF-16 code units, which is what the TreeWalker's
+  // `textContent.length` arithmetic counts. A byte- or char-based port would
+  // return a plausible number here and highlight the wrong span.
+  it('anchors correctly when the document contains emoji before the quote', () => {
+    const doc = docFrom('<p>🎯🎯🎯 aim at TARGET now</p>');
+    expect(highlightQuote(doc, sel({ exact: 'TARGET', prefix: 'aim at ' }), 'TARGET'))
+      .toEqual(CONFIDENT);
+    expect(highlightedText(doc)).toBe('TARGET');
+    expect(wholeText(doc.body)).toBe('🎯🎯🎯 aim at TARGET now');
   });
 });

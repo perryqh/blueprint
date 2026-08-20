@@ -1325,6 +1325,61 @@ async fn anonymous_blueprint_writes_are_rejected_when_auth_is_enabled() {
     assert_eq!(phantom.status(), 404);
 }
 
+/// The reviewer resolves anchors through a wasm module embedded from
+/// `frontend/pkg/`, and two failure modes there are silent until someone opens a
+/// plan in a browser.
+///
+/// The artifact is built by `wasm-pack`, *not* by cargo, and `rust-embed` reads
+/// `frontend/` at compile time — so a checkout that never ran the wasm build
+/// produces a daemon that 404s the module and renders every comment as drifted.
+/// Separately, the glue calls `WebAssembly.instantiateStreaming`, which requires
+/// exactly `application/wasm`; anything else silently downgrades to the slower
+/// path with a console warning nobody reads. A cheap request pins both.
+#[tokio::test]
+async fn the_anchoring_wasm_module_is_embedded_and_served_as_wasm() {
+    let s = spawn().await;
+    let http = client();
+
+    let wasm = http
+        .get(format!("{}/static/pkg/anchor_bg.wasm", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wasm.status(),
+        200,
+        "anchoring wasm is missing — run `wasm-pack build` (see README)"
+    );
+    assert_eq!(
+        wasm.headers().get("content-type").unwrap(),
+        "application/wasm",
+        "instantiateStreaming needs this exact type"
+    );
+    assert!(
+        !wasm.bytes().await.unwrap().is_empty(),
+        "embedded wasm is empty"
+    );
+
+    // The glue is what the page actually imports, so a missing sibling is the
+    // same outage by a different route.
+    let glue = http
+        .get(format!("{}/static/pkg/anchor.js", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(glue.status(), 200);
+    let ctype = glue
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ctype.contains("javascript"),
+        "glue served as {ctype}; a module script has to be a JS type"
+    );
+}
+
 /// `POST /api/shutdown-if-empty` was left ungated when the create/replace/delete
 /// gate landed, so an anonymous caller could stop the daemon outright.
 ///

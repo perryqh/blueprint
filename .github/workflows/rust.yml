@@ -19,14 +19,17 @@ jobs:
     # rustfmt and clippy come from rust-toolchain.toml, which also pins the
     # version — so a formatting or lint disagreement here means the code
     # changed, not that the runner shipped a different toolchain than you have.
+    # `--workspace` everywhere: the anchoring crate is a workspace member, and
+    # without the flag cargo touches only the root package — so the crate holding
+    # the algorithm would go unlinted and untested while CI stayed green.
     - name: Check formatting
-      run: cargo fmt --check
+      run: cargo fmt --all --check
     - name: Clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --workspace --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --workspace --verbose
     # Catches the tail of the `plan-share` → `blueprint` rename that the compiler
     # can't see: string literals in URLs, env-var names, help text, comments,
     # docs, and frontend JS.
@@ -44,13 +47,14 @@ jobs:
       run: |
         if git grep -In -e 'plan-share' -e 'plan_share' -e 'PLAN_SHARE' \
              -- '*.rs' '*.toml' '*.md' '*.js' '*.html' '*.css' '*.json' \
-             ':!Cargo.lock'; then
+             ':!Cargo.lock' ':!frontend/pkg'; then
           echo "::error::stale plan-share reference(s) above — drop or rename"
           exit 1
         fi
 
-  # The anchoring algorithm lives in JavaScript, so it needs its own runner.
-  # Split from the Rust job so a JS failure is legible at a glance.
+  # The DOM half of anchoring is still JavaScript, so it needs its own runner.
+  # Split from the Rust job so a JS failure is legible at a glance. Runs against
+  # the committed wasm artifact — the same one the daemon serves.
   frontend:
     runs-on: ubuntu-latest
 
@@ -63,3 +67,35 @@ jobs:
       run: npm ci
     - name: Test
       run: npx vitest run
+
+  # `frontend/pkg/` is a build output that has to be committed, because
+  # `rust-embed` reads `frontend/` at compile time and therefore needs the wasm
+  # to already exist — otherwise a plain `cargo install --path .` yields a daemon
+  # that 404s its own anchoring module.
+  #
+  # The hazard that creates: edit `anchor/src/`, forget to rebuild, and every
+  # other check still passes. The Rust tests exercise the crate source, the JS
+  # tests exercise the stale artifact, and production serves the stale one. So
+  # rebuild here and require the result to be byte-identical to what was
+  # committed. Reproducibility rests on rustc (pinned by rust-toolchain.toml),
+  # wasm-bindgen (pinned by Cargo.lock), and wasm-pack (pinned below).
+  wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install wasm-pack
+      run: cargo install wasm-pack --version 0.15.0 --locked
+    - name: Rebuild the artifact
+      run: |
+        wasm-pack build anchor --target web --out-dir ../frontend/pkg \
+          --out-name anchor --no-typescript --no-pack --release -- --features wasm
+        # wasm-pack drops an ignore-everything .gitignore in its out-dir, which
+        # would make the diff below vacuously clean.
+        rm -f frontend/pkg/.gitignore
+    - name: Committed artifact matches its source
+      run: |
+        if ! git diff --exit-code -- frontend/pkg; then
+          echo "::error::frontend/pkg is stale — rebuild it (see README) and commit the result"
+          exit 1
+        fi

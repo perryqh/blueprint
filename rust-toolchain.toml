@@ -1,4 +1,12 @@
 [toolchain]
 channel = "1.97.1"
 components = ["clippy", "rustfmt"]
-targets = ["x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+targets = [
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  # The anchoring crate compiles to wasm for the reviewer frontend. Listed here
+  # so rustup provisions it on checkout and `wasm-pack build` doesn't fail on a
+  # fresh clone with "target may not be installed".
+  "wasm32-unknown-unknown",
+]

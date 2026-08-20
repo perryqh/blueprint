@@ -6,6 +6,7 @@
 // the wiring: DOM lookups, app state, and the delegated event handlers.
 
 import {
+  initAnchoring,
   captureSelector,
   highlightQuote,
   clearHighlights,
@@ -36,6 +37,11 @@ let allComments = [];
 let pendingDraft = null;
 let lastTs = 0;
 let drifted = new Set();
+// Quotes that resolved, but only by falling back to the first occurrence because
+// no occurrence agreed with the recorded context — so the highlight is probably
+// on the wrong paragraph. Kept separate from `drifted`: the text is still there,
+// which is a different thing to tell the reviewer.
+let misanchored = new Set();
 let pendingInNewVersion = new Set();
 let lastBlueprintVersion = null;
 let pendingBlueprintVersion = null;
@@ -232,7 +238,24 @@ function expandAll() {
   renderSidebar();
 }
 
-blueprintFrame.addEventListener('load', () => {
+// Kicked off at module load so the wasm fetch overlaps the iframe's own load
+// rather than starting after it.
+const anchoringReady = initAnchoring().catch(e => {
+  // Without the module nothing can anchor, and silently rendering every comment
+  // as "drifted" would look like the plan changed. Say what actually happened.
+  console.error('anchoring module failed to load', e);
+  showToast('Anchoring unavailable — highlights are disabled', 'error');
+  throw e;
+});
+
+blueprintFrame.addEventListener('load', async () => {
+  // Resolution runs through wasm, so nothing can highlight until it's
+  // instantiated. Everything downstream of the first render waits on this.
+  try {
+    await anchoringReady;
+  } catch {
+    return;
+  }
   setupFrameListeners();
   refreshComments();
   poller.start();
@@ -735,6 +758,7 @@ function renderSidebar() {
   const state = {
     byParent,
     drifted,
+    misanchored,
     pendingInNewVersion,
     collapsedQuotes,
     focusedThreadIdx,
@@ -925,6 +949,7 @@ function applyHighlights() {
   if (!doc) return;
   clearHighlights(doc);
   drifted = new Set();
+  misanchored = new Set();
   pendingInNewVersion = new Set();
   const tops = allComments.filter(c => !c.parent_id);
   const seen = new Set();
@@ -933,7 +958,8 @@ function applyHighlights() {
     const q = c.selector.exact;
     if (seen.has(q)) continue;
     seen.add(q);
-    if (!highlightQuote(doc, c.selector, q, focusQuote)) {
+    const { anchored, confident } = highlightQuote(doc, c.selector, q, focusQuote);
+    if (!anchored) {
       // If there's a pending plan update, the anchor may exist in the next version
       // the user hasn't loaded yet. Render distinctly so they don't mistake it for drift.
       if (hasPendingUpdate) {
@@ -941,6 +967,8 @@ function applyHighlights() {
       } else {
         drifted.add(q);
       }
+    } else if (!confident) {
+      misanchored.add(q);
     }
   }
 }

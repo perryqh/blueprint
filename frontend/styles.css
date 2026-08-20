@@ -704,6 +704,27 @@ iframe#blueprint-frame {
   letter-spacing: 0.04em;
   font-weight: var(--weight-semibold);
 }
+/* Anchored, but on an unconfirmed occurrence. Deliberately milder than
+   `.drifted`: the border warns without the filled background, and the tag is
+   outlined rather than solid, so the two are distinguishable at a glance —
+   drift means the text is gone, this means it might be the wrong copy. Both use
+   the warn palette because both are "this anchor needs a human". */
+.comments .group.misanchored {
+  border-color: var(--color-warn-border);
+}
+.comments .group .misanchor-tag {
+  display: inline-block;
+  font-size: var(--text-xs);
+  background: transparent;
+  color: var(--color-warn-fg);
+  border: 1px solid var(--color-warn-border);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  margin-left: var(--space-2);
+  vertical-align: 1px;
+  letter-spacing: 0.04em;
+  font-weight: var(--weight-semibold);
+}
 .comments .group.pending {
   border-color: var(--color-info-border);
   background: var(--color-info-bg);

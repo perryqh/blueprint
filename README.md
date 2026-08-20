@@ -16,6 +16,7 @@ Everything below assumes a fresh clone of this repo and `~/.cargo/bin` on your `
 
 - Rust toolchain (1.74+). `rustup` is the easy path.
 - macOS or Linux. On Linux, install `libsqlite3-dev` and `pkg-config` if a build fails on rusqlite; macOS has them via the SDK.
+- No wasm toolchain needed to build or run: the anchoring module is committed under `frontend/pkg/`. You only need `wasm-pack` if you change `anchor/` — see [Rebuilding the wasm module](#rebuilding-the-wasm-module).
 - Claude Code CLI installed and authenticated, if you want the `/blueprint` skill to drive the loop.
 
 ### 2. Build and install the binary
@@ -139,7 +140,19 @@ blueprint unpublish <slug>                       # daemon stops when no blueprin
 
 **Daemon.** Runs on `127.0.0.1:7321` by default. Lock file at `~/.blueprint/daemon.lock` records PID + port. Any CLI subcommand reuses a live daemon or spawns a detached child. The lock file is PID-scoped, so a graceful shutdown of an old daemon can't clobber a replacement's lock during handoff.
 
-**Anchoring.** Comments store a [TextQuoteSelector](https://www.w3.org/TR/annotation-model/#text-quote-selector) — `exact` text plus ~32 chars of `prefix` and `suffix`. The browser walks the iframe's text nodes, finds the first occurrence whose context matches, wraps the range in a `<span data-ps-hl>`, and binds a click handler that scrolls the matching comment group in the sidebar. If `exact` no longer appears, the comment renders as **drifted** (yellow badge).
+**Anchoring.** Comments store a [TextQuoteSelector](https://www.w3.org/TR/annotation-model/#text-quote-selector) — `exact` text plus 32 UTF-16 code units of `prefix` and `suffix`. The browser walks the iframe's text nodes, finds the occurrence whose context matches, wraps the range in a `<span data-ps-hl>`, and binds a click handler that scrolls the matching comment group in the sidebar.
+
+Choosing *which* occurrence lives in the `blueprint-anchor` crate, compiled to wasm and loaded by `anchor.js` — one implementation shared by the daemon and the browser rather than a Rust copy and a JS copy kept in step by hand. The JS keeps what needs a DOM: flattening text, mapping offsets onto text nodes, building the Ranges. Offsets are UTF-16 code units end to end, because that is what JS string indices are; see the crate docs for why context crosses the boundary as a `Uint16Array` and not a string.
+
+Three outcomes, three renderings:
+
+| Outcome | Sidebar |
+| --- | --- |
+| Context confirmed the occurrence | no badge |
+| Quote found, but no occurrence matched the recorded context | **may be misplaced** (outlined badge) |
+| `exact` no longer appears at all | **drifted** (yellow badge) |
+
+The middle case used to be indistinguishable from the first: resolution returned a bare index, so a comment whose surroundings had been edited would silently attach to the first occurrence of the quote — some other paragraph — and present as a clean match. It still anchors there, because reporting drift on text that is plainly still present tested worse; it now says so.
 
 **Bidirectional click-to-scroll.** Click a highlighted span → sidebar group flashes blue. Click a sidebar group's body → the highlight in the iframe pulses. Inputs/buttons inside the group are excluded so reply forms still work.
 
@@ -190,45 +203,87 @@ Every `Comment` returned by the API includes `role` (`"owner" | "user" | "guest"
 
 ```
 blueprint/
-├── Cargo.toml
+├── Cargo.toml              # workspace root + the daemon package
 ├── src/
 │   ├── lib.rs              # public re-exports for tests
 │   ├── main.rs             # CLI entry
 │   ├── cli.rs              # publish / watch / fetch / comment / unpublish / status / watch --stream
 │   ├── daemon.rs           # detached-child spawn, PID-scoped lock file, spawn flock
-│   ├── server.rs           # axum routes + AppState (blueprint_versions, finish_signals, events broadcast)
-│   ├── store.rs            # rusqlite — blueprints, comments, users, batch-insert
-│   ├── auth.rs             # GitHub OAuth + session wiring + CLI bearer token
-│   ├── selector.rs         # TextQuoteSelector type
-│   ├── slug.rs             # adjective-month-animal generator
+│   ├── server.rs           # axum routes + AppState (blueprint_versions, finish latch, events broadcast)
+│   ├── store.rs            # rusqlite — blueprints, comments, users, batch-insert, migrations
+│   ├── session_store.rs    # SQLite-backed session store, so OAuth survives a restart
+│   ├── auth.rs             # GitHub OAuth + session wiring + CLI bearer + the write gate
+│   ├── selector.rs         # re-export of the selector type from blueprint-anchor
+│   ├── slug.rs             # adjective-month-animal generator + entropy suffix
+│   ├── mcp.rs              # stdio MCP server (JSON-RPC 2.0)
 │   ├── review_file.rs      # crit-compatible review.json writer
 │   └── error.rs            # AppError → axum response
-├── frontend/               # embedded via rust-embed (no Node build step)
+├── anchor/                 # workspace member — the only crate that also targets wasm
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs          # quote resolution + the UTF-16 rationale, with its tests
+│       ├── selector.rs     # TextQuoteSelector
+│       └── wasm.rs         # wasm-bindgen surface (feature = "wasm")
+├── frontend/               # embedded via rust-embed
 │   ├── index.html          # landing
 │   ├── reviewer.html       # /b/:slug shell — iframe, sidebar, drafts bar, update banner
-│   ├── app.js              # iframe wiring, TextQuoteSelector matcher, drafts batching
+│   ├── app.js              # wiring: DOM lookups, app state, delegated handlers
+│   ├── anchor.js           # DOM side of anchoring; calls into the wasm module
+│   ├── render.js           # sidebar rendering (no innerHTML)
+│   ├── poll.js             # polling with backoff + disconnect banner
+│   ├── drafts.js           # staged drafts, per-slug localStorage
+│   ├── dom.js, toast.js    # small shared helpers
+│   ├── pkg/                # wasm-pack output — CHECKED IN, see Tests
 │   └── styles.css
+├── js-tests/               # vitest, jsdom — the frontend modules
 ├── integrations/
 │   └── claude-code/skills/blueprint/SKILL.md
 └── tests/
-    ├── e2e.rs                   # in-process daemon, HTTP-level e2e
-    ├── concurrent.rs            # multi-repo + batch endpoint
-    ├── cli_smoke.rs             # spawns the binary, round-trips publish/status/unpublish
-    └── no_legacy_references.rs  # safety net for the rename — fails on stale strings
+    ├── e2e.rs              # in-process daemon, HTTP-level e2e, OAuth, write gate
+    ├── concurrent.rs       # multi-repo + batch endpoint
+    ├── finish.rs           # the exactly-once finish latch
+    ├── security.rs         # /raw sandboxing, body cap, long-poll pools
+    ├── mcp.rs              # MCP protocol + tools/call
+    ├── versioning.rs       # --update archives prior HTML
+    └── cli_smoke.rs        # spawns the binary, round-trips publish/status/unpublish
 ```
 
-Stack: `axum`, `tokio`, `rusqlite` (bundled), `nix` (flock), `serde`, `clap`, `rust-embed`, `reqwest`, `oauth2`, `tower-sessions`.
+Stack: `axum`, `tokio`, `rusqlite` (bundled), `nix` (flock), `serde`, `clap`, `rust-embed`, `reqwest`, `oauth2`, `tower-sessions`, `parking_lot`. Frontend: no framework, no bundler — native ES modules plus one wasm module (`wasm-bindgen`).
 
 ## Tests
 
 ```bash
-cargo test    # Rust: daemon, store, CLI, MCP
-npm test      # frontend ES modules, via vitest
+cargo test --workspace   # Rust: daemon, store, CLI, MCP, and quote resolution
+npm test                 # frontend ES modules, via vitest
 ```
 
-Rust covers: publish → comment → reply → finish → fetch → update → drift → unpublish; random-slug generation; empty-HTML / empty-body / unknown-parent rejection; the `GET /api/blueprints` summary shape; `wait-comment` fast-path and slow-path; OAuth round-trip against a mock GitHub; CLI bearer-token write-auth and the blueprint write gate in both directions; multi-repo concurrency (`shutdown-if-empty`, `X-Client-Cwd`); the batch endpoint (atomicity, single wake-up); schema migrations; and a CLI subprocess smoke test.
+`--workspace` matters: without it cargo tests only the root package and skips
+`anchor/`, where the resolution algorithm and its cases live.
 
-JS covers the four frontend modules with real behaviour, not smoke tests: the anchoring algorithm (including the known-wrong first-`indexOf` fallback, quotes spanning inline markup, and a surrogate pair split by the context window), poll backoff and the disconnect banner, draft storage, and rendering.
+### Rebuilding the wasm module
+
+`frontend/pkg/` is a build output that is **checked in**, because `rust-embed`
+reads `frontend/` at compile time — so the artifact has to exist before
+`cargo build`, or `cargo install --path .` produces a daemon that 404s its own
+anchoring module. Nobody needs `wasm-pack` to build or run blueprint; you need it
+only when you change `anchor/`:
+
+```bash
+cargo install wasm-pack --version 0.15.0 --locked   # once
+wasm-pack build anchor --target web --out-dir ../frontend/pkg \
+  --out-name anchor --no-typescript --no-pack --release -- --features wasm
+rm -f frontend/pkg/.gitignore   # wasm-pack writes an ignore-everything file
+```
+
+Then commit the result. CI rebuilds it and fails if the committed bytes differ,
+so a forgotten rebuild can't ship a daemon whose wasm disagrees with its source —
+the one failure mode that every other check would pass.
+
+Rust covers: publish → comment → reply → finish → fetch → update → drift → unpublish; random-slug generation; empty-HTML / empty-body / unknown-parent rejection; the `GET /api/blueprints` summary shape; `wait-comment` fast-path and slow-path; OAuth round-trip against a mock GitHub; CLI bearer-token write-auth and the blueprint write gate in both directions; multi-repo concurrency (`shutdown-if-empty`, `X-Client-Cwd`); the batch endpoint (atomicity, single wake-up); schema migrations; that the wasm module is embedded and served as `application/wasm`; and a CLI subprocess smoke test.
+
+`anchor/` covers quote resolution as a table of cases: duplicate quotes disambiguated by prefix, suffix, or both; the known-wrong first-occurrence fallback, now asserted to *report itself* as a fallback; a prefix longer than the window; a prefix opening on an unpaired surrogate, which is the case that forces code units rather than `&str`; combining marks left unnormalized; and the empty quote that made the JS original spin forever.
+
+JS covers the frontend modules with real behaviour, not smoke tests: the DOM side of anchoring against the actual wasm module (so the JS↔wasm boundary is exercised, not mocked) — offsets landing on text-node boundaries, quotes spanning inline markup, emoji ahead of the quote — plus poll backoff and the disconnect banner, draft storage, and rendering.
 
 Not covered by either suite: click-to-scroll and collapse interactions in a live browser (manual verification only).
 

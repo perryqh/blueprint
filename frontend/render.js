@@ -229,12 +229,16 @@ export function renderGroup({ quote, cs, visibleIdx, state, ctx }) {
   const resolved = isThreadResolved(cs);
   const isPending = state.pendingInNewVersion.has(quote);
   const isDrifted = state.drifted.has(quote);
+  // Anchored, but on an occurrence the recorded context didn't confirm. Distinct
+  // from drift: the quote is still in the document, it's the *placement* that's
+  // in doubt. `?? false` keeps callers that predate the flag working.
+  const isMisanchored = state.misanchored?.has(quote) ?? false;
   // Resolved threads default to collapsed (overridable per-thread).
   const isCollapsed = state.collapsedQuotes.has(quote)
     || (resolved && !state.collapsedQuotes.has('!' + quote));
   const group = document.createElement('div');
   group.className = 'group'
-    + (isPending ? ' pending' : isDrifted ? ' drifted' : '')
+    + (isPending ? ' pending' : isDrifted ? ' drifted' : isMisanchored ? ' misanchored' : '')
     + (resolved ? ' resolved' : '')
     + (isCollapsed ? ' collapsed' : '')
     + (visibleIdx === state.focusedThreadIdx ? ' focused' : '');
@@ -279,6 +283,13 @@ export function renderGroup({ quote, cs, visibleIdx, state, ctx }) {
     const tag = document.createElement('span');
     tag.className = 'drift-tag';
     tag.textContent = 'drifted';
+    toggle.appendChild(tag);
+  } else if (isMisanchored) {
+    const tag = document.createElement('span');
+    tag.className = 'misanchor-tag';
+    tag.textContent = 'may be misplaced';
+    tag.title = 'The quoted text still exists, but the surrounding text has '
+      + 'changed, so this highlight may be on the wrong occurrence.';
     toggle.appendChild(tag);
   }
   // Reply count badge (only visible when collapsed via CSS).
