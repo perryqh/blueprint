@@ -275,9 +275,21 @@ wasm-pack build anchor --target web --out-dir ../frontend/pkg \
 rm -f frontend/pkg/.gitignore   # wasm-pack writes an ignore-everything file
 ```
 
-Then commit the result. CI rebuilds it and fails if the committed bytes differ,
-so a forgotten rebuild can't ship a daemon whose wasm disagrees with its source —
-the one failure mode that every other check would pass.
+Then commit the result. A forgotten rebuild is the one failure mode every other
+check passes — the Rust tests exercise the source, the JS tests and production
+exercise the stale artifact — so CI guards it in two parts:
+
+- **The glue** (`anchor.js`) is compared byte for byte. wasm-bindgen's JS output
+  is deterministic, and it changes whenever the exported API does.
+- **The `.wasm`** is compared *behaviourally* against a fresh build, by
+  `scripts/check-wasm-parity.mjs`, which runs ~3,000 cases through both modules
+  and requires identical answers. Bytes can't be compared here: wasm codegen
+  isn't reproducible across platforms, so a macOS laptop and an ubuntu runner
+  emit functionally identical modules that differ byte for byte.
+
+The corpus is mostly seeded-random, plus hand-written cases for the shapes random
+generation won't reliably produce — self-overlapping quotes especially, which are
+the only way to observe the scan's step size.
 
 Rust covers: publish → comment → reply → finish → fetch → update → drift → unpublish; random-slug generation; empty-HTML / empty-body / unknown-parent rejection; the `GET /api/blueprints` summary shape; `wait-comment` fast-path and slow-path; OAuth round-trip against a mock GitHub; CLI bearer-token write-auth and the blueprint write gate in both directions; multi-repo concurrency (`shutdown-if-empty`, `X-Client-Cwd`); the batch endpoint (atomicity, single wake-up); schema migrations; that the wasm module is embedded and served as `application/wasm`; and a CLI subprocess smoke test.
 

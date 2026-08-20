@@ -75,27 +75,38 @@ jobs:
   #
   # The hazard that creates: edit `anchor/src/`, forget to rebuild, and every
   # other check still passes. The Rust tests exercise the crate source, the JS
-  # tests exercise the stale artifact, and production serves the stale one. So
-  # rebuild here and require the result to be byte-identical to what was
-  # committed. Reproducibility rests on rustc (pinned by rust-toolchain.toml),
-  # wasm-bindgen (pinned by Cargo.lock), and wasm-pack (pinned below).
+  # tests exercise the stale artifact, and production serves the stale one.
+  #
+  # Comparing bytes against a fresh build does NOT work — wasm codegen is not
+  # reproducible across platforms, so an ubuntu runner and a macOS laptop emit
+  # functionally identical modules with different bytes. (Measured, not assumed:
+  # the first run of this job failed on exactly that, and only on the `.wasm` —
+  # wasm-bindgen's JS glue *was* byte-identical.)
+  #
+  # So: byte-compare the glue, which is deterministic and moves whenever the
+  # exported API does, and compare the `.wasm` behaviourally against a fresh
+  # build over a corpus. That is immune to codegen noise and still catches an
+  # artifact whose behaviour has drifted from the source beside it.
   wasm:
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
     - name: Install wasm-pack
       run: cargo install wasm-pack --version 0.15.0 --locked
-    - name: Rebuild the artifact
+    # Into a scratch dir, so the committed artifact survives for comparison.
+    - name: Build a fresh artifact from source
       run: |
-        wasm-pack build anchor --target web --out-dir ../frontend/pkg \
+        wasm-pack build anchor --target web --out-dir /tmp/pkg-fresh \
           --out-name anchor --no-typescript --no-pack --release -- --features wasm
-        # wasm-pack drops an ignore-everything .gitignore in its out-dir, which
-        # would make the diff below vacuously clean.
-        rm -f frontend/pkg/.gitignore
-    - name: Committed artifact matches its source
+    - name: Glue matches its source
       run: |
-        if ! git diff --exit-code -- frontend/pkg; then
-          echo "::error::frontend/pkg is stale — rebuild it (see README) and commit the result"
+        if ! diff -u frontend/pkg/anchor.js /tmp/pkg-fresh/anchor.js; then
+          echo "::error::frontend/pkg/anchor.js is stale — rebuild it (see README) and commit the result"
           exit 1
         fi
+    - name: Committed wasm behaves identically to a fresh build
+      run: node scripts/check-wasm-parity.mjs frontend/pkg /tmp/pkg-fresh
