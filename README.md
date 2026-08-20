@@ -4,6 +4,10 @@ Share interactive HTML blueprints with reviewers and let them leave inline ancho
 
 `crit` shows source; `blueprint` shows the *rendered* page. Same daemon/CLI shape so muscle memory transfers.
 
+![The blueprint reviewer: rendered plan on the left with an anchored highlight, threaded comments on the right](docs/img/reviewer-ui.png)
+
+The rendered plan sits in an iframe on the left; comments anchor to quoted text (`full-codebase`, highlighted) and thread in the sidebar on the right, where a `drifted` badge marks a quote whose surrounding text has since changed and the `owner` badge marks the one role that triggers a plan edit.
+
 ## Status
 
 **Phase 0 — localhost MVP.** Single Rust binary, SQLite at `~/.blueprint/blueprints.db`, optional GitHub OAuth, vanilla-JS text-quote anchoring. Phase 1 (personal hosting) and Phase 2 (internal + Okta) are designed but not built.
