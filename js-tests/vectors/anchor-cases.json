@@ -1,0 +1,216 @@
+{
+  "$comment": [
+    "The case table for text-quote resolution (frontend/anchor.js findQuoteIndex),",
+    "kept as data rather than inline so the cases are readable as a spec and can be",
+    "added to without touching test plumbing.",
+    "",
+    "Offsets are UTF-16 code units, because that is what JS string indices are and",
+    "the context window is a fixed count of them. Half these cases exist to pin",
+    "that: an implementation counting bytes or code points agrees on ASCII and",
+    "diverges on the first emoji, where one character is two code units.",
+    "",
+    "`index` absent means the quote does not resolve at all — the caller renders",
+    "that as drifted. Every field here is asserted; `$note` is prose for the",
+    "reader, and is the only thing that isn't.",
+    "",
+    "Two cases can't live in JSON and stay hand-written in anchor.test.js: a prefix",
+    "beginning on an unpaired surrogate (JSON cannot carry a lone surrogate), and",
+    "anything asserting that a call terminates rather than hangs."
+  ],
+  "cases": [
+    {
+      "name": "unique quote — context is redundant but must not break the match",
+      "text": "alpha beta gamma",
+      "exact": "beta",
+      "prefix": "alpha ",
+      "suffix": " gamma",
+      "index": 6
+    },
+    {
+      "name": "unique quote with no context at all",
+      "text": "alpha beta gamma",
+      "exact": "beta",
+      "index": 6
+    },
+    {
+      "name": "duplicate quotes — prefix disambiguates to the second",
+      "text": "the cat sat. the dog sat. done",
+      "exact": "sat",
+      "prefix": "the dog ",
+      "index": 21
+    },
+    {
+      "name": "duplicate quotes — suffix disambiguates to the second",
+      "text": "x: value one. x: value two.",
+      "exact": "x: value",
+      "suffix": " two.",
+      "index": 14
+    },
+    {
+      "name": "duplicate quotes — prefix+suffix together pick the middle one",
+      "text": "a ref b. c ref d. e ref f.",
+      "exact": "ref",
+      "prefix": "c ",
+      "suffix": " d.",
+      "index": 11
+    },
+    {
+      "name": "duplicate quotes — no occurrence agrees, so the first wins (known-wrong)",
+      "$note": "The expected offset here is the WRONG one, deliberately. When the text around a quote has been edited so no occurrence matches the recorded context, the scan falls through and returns the first hit — very likely a different paragraph than the reviewer selected. Reporting drift on text that is plainly still present tested worse. If this case changes, someone revisited that trade-off on purpose.",
+      "text": "one HIT two HIT three HIT four",
+      "exact": "HIT",
+      "prefix": "ZZZZ ",
+      "suffix": " QQQQ",
+      "index": 4
+    },
+    {
+      "name": "the same haystack with context that does agree picks the third",
+      "text": "one HIT two HIT three HIT four",
+      "exact": "HIT",
+      "prefix": "three ",
+      "index": 22
+    },
+    {
+      "name": "empty prefix opts out of the prefix check; suffix still decides",
+      "$note": "A selection at the very start of a document legitimately records prefix ''. Empty is falsy, so it disables that half of disambiguation — the same path as 'no prefix recorded'.",
+      "text": "aa ZZ bb ZZ cc",
+      "exact": "ZZ",
+      "prefix": "",
+      "suffix": " cc",
+      "index": 9
+    },
+    {
+      "name": "absent prefix behaves exactly like an empty one",
+      "$note": "The daemon omits absent context via skip_serializing_if, so selectors arrive with the field missing rather than empty. Both must behave identically.",
+      "text": "aa ZZ bb ZZ cc",
+      "exact": "ZZ",
+      "suffix": " cc",
+      "index": 9
+    },
+    {
+      "name": "a quote at the very start has no prefix to check",
+      "text": "ZZ leads here",
+      "exact": "ZZ",
+      "prefix": "",
+      "suffix": " leads",
+      "index": 0
+    },
+    {
+      "name": "a quote at the very end has no suffix to check",
+      "text": "trails with ZZ",
+      "exact": "ZZ",
+      "prefix": "with ",
+      "suffix": "",
+      "index": 12
+    },
+    {
+      "name": "prefix longer than the 32-unit window matches on its tail",
+      "$note": "Only the last 32 units are compared, because that is all captureSelector recorded and all the haystack slice provides.",
+      "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxTARGET tail",
+      "exact": "TARGET",
+      "prefix": "yyyyyyyyyyyyyyyyyyyyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "index": 50
+    },
+    {
+      "name": "suffix longer than the 32-unit window matches on its head",
+      "text": "lead TARGET bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "exact": "TARGET",
+      "suffix": " bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "index": 5
+    },
+    {
+      "name": "no match — quote is simply gone",
+      "text": "nothing to see here",
+      "exact": "absent",
+      "prefix": "no",
+      "suffix": "pe"
+    },
+    {
+      "name": "a quote longer than the haystack is absent, not an error",
+      "text": "short",
+      "exact": "much longer than that"
+    },
+    {
+      "name": "an empty haystack has nothing to find",
+      "text": "",
+      "exact": "anything"
+    },
+    {
+      "name": "an empty quote is unanchorable",
+      "$note": "Also load-bearing for termination — see the hand-written companion case. indexOf('', n) clamps to length instead of returning -1, so an unguarded scan whose cursor is found+1 stops advancing the result and loops until the tab dies.",
+      "text": "any text at all",
+      "exact": "",
+      "prefix": "ZZZZ"
+    },
+    {
+      "name": "an empty quote with no context either",
+      "$note": "A behaviour change, not just a hang fix. Without the guard this case did NOT hang — with no context to disagree with, the first iteration matched and returned 0, i.e. a zero-length highlight at the start of the document. It now reports no match and renders as drifted, which is the honest answer for a quote that cannot be anchored to anything.",
+      "text": "any text at all",
+      "exact": ""
+    },
+    {
+      "name": "combining marks are matched as written, never normalized",
+      "$note": "'e' + U+0301 is two code units and is not equal to precomposed U+00E9. No normalization happens anywhere, so a selector recorded in one form will not match text stored in the other. Asserted so the limitation is documented rather than discovered by a reviewer whose comment vanished.",
+      "text": "café menu",
+      "exact": "café"
+    },
+    {
+      "name": "precomposed matches precomposed",
+      "text": "café menu",
+      "exact": "café",
+      "index": 0
+    },
+    {
+      "name": "emoji before the quote shift the offset by two units each",
+      "$note": "Three astral characters = 6 code units, so TARGET starts at 6 + ' aim at '.length.",
+      "text": "🎯🎯🎯 aim at TARGET now",
+      "exact": "TARGET",
+      "prefix": "aim at ",
+      "index": 14
+    },
+    {
+      "name": "an astral prefix filling the window exactly still matches",
+      "$note": "16 emoji = 32 code units, the whole window.",
+      "text": "lead 🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯TARGET trail",
+      "exact": "TARGET",
+      "prefix": "🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯",
+      "index": 37
+    },
+    {
+      "name": "self-overlapping quote — the scan steps one unit, not the match length",
+      "$note": "Occurrence 2 begins inside occurrence 1. A cursor advancing by the match length skips it and answers 2 instead of 1. This is the only shape that observes the step size, and randomly generated text does not reliably produce it.",
+      "text": "aaaa",
+      "exact": "aa",
+      "prefix": "a",
+      "index": 1
+    },
+    {
+      "name": "self-overlapping, longer quote",
+      "text": "aaaaa",
+      "exact": "aaa",
+      "prefix": "a",
+      "index": 1
+    },
+    {
+      "name": "self-overlapping with a repeating multi-unit token",
+      "text": "abababab",
+      "exact": "abab",
+      "prefix": "ab",
+      "index": 2
+    },
+    {
+      "name": "self-overlapping, disambiguated by suffix instead",
+      "text": "aaaa",
+      "exact": "aa",
+      "suffix": "a",
+      "index": 0
+    },
+    {
+      "name": "self-overlapping astral quote",
+      "text": "🎯🎯🎯🎯",
+      "exact": "🎯🎯",
+      "prefix": "🎯",
+      "index": 2
+    }
+  ]
+}
