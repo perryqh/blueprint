@@ -1,0 +1,40 @@
+[package]
+name = "blueprint-anchor"
+version = "0.1.0"
+edition = "2024"
+description = "Resolve a TextQuoteSelector against a document's flattened text"
+
+[lib]
+name = "blueprint_anchor"
+# `rlib` is what the daemon links against; `cdylib` is what wasm-pack needs to
+# emit a `.wasm`. Both are listed unconditionally because Cargo can't gate
+# crate-type on a feature — a native build pays for an unused dylib, which is
+# cheaper than maintaining two manifests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Only pulled in for the `wasm` feature, which is the only configuration
+# wasm-pack builds. The daemon depends on this crate without it, so the native
+# build never sees wasm-bindgen at all.
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+wasm = ["dep:wasm-bindgen"]
+
+# The `wasm-opt` that wasm-pack downloads predates the bulk-memory instructions
+# rustc now emits by default, so it rejects its own input as invalid unless the
+# proposals are enabled by name. Without this the build fails outright rather
+# than producing an unoptimized artifact.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+  '-O',
+  '--enable-bulk-memory',
+  '--enable-nontrapping-float-to-int',
+  '--enable-sign-ext',
+]
+
+[dev-dependencies]
+# The selector tests assert serde behaviour, including that an unpaired
+# surrogate escape is refused.
+serde_json = "1"

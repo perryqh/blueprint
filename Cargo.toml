@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "Share interactive HTML blueprints with inline anchored comments"
 
+# The anchoring algorithm lives in its own member crate because it is the one
+# piece of the daemon that also has to compile to wasm32 for the browser, and
+# this package cannot: rusqlite, tokio and axum have no wasm target.
+[workspace]
+members = ["anchor"]
+
 [dependencies]
+blueprint-anchor = { path = "anchor" }
 axum = { version = "0.7", features = ["macros"] }
 # Named rather than "full": these are the features actually reachable from the
 # code, so the list doubles as documentation of what the daemon uses.

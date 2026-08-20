@@ -1,5 +1,8 @@
 [hooks]
-pre-commit = "cargo clippy --all-targets --all-features -- -D warnings && cargo test && cargo fmt -- --check"
+# `--workspace` throughout: without it these run against the root package only,
+# and the anchoring crate — where the algorithm and its tests now live — would be
+# silently skipped by the hook that exists to catch exactly that.
+pre-commit = "cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace && cargo fmt --all -- --check"
 
 [logging]
 verbose = true
