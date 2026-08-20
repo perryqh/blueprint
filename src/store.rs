@@ -552,6 +552,20 @@ impl Store {
         Ok(out)
     }
 
+    /// Per-blueprint counts for `GET /api/blueprints` and `blueprint status`.
+    ///
+    /// **A thread is a top-level comment plus its reply subtree, and it is
+    /// unresolved iff that top-level comment is.** Replies are never resolvable
+    /// on their own — the reviewer resolves a thread, and the UI sends that
+    /// against the top-level comment's id — so counting reply rows here made
+    /// `unresolved_count` unreachable-by-design: a fully reviewed plan reported
+    /// one "unresolved" per reply, forever, and a thread with replies could
+    /// never contribute zero.
+    ///
+    /// This is the daemon's definition and the only one; `render.js` renders
+    /// from it rather than deriving a second answer. `comment_count` still
+    /// counts every row, replies included — that one is a raw total and reads
+    /// correctly as one.
     pub fn list_blueprint_summaries(&self) -> Result<Vec<BlueprintSummary>, AppError> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -560,7 +574,8 @@ impl Store {
                  b.created_at, \
                  b.client_cwd, \
                  COUNT(c.id) AS comment_count, \
-                 COALESCE(SUM(CASE WHEN c.resolved = 0 THEN 1 ELSE 0 END), 0) AS unresolved_count, \
+                 COALESCE(SUM(CASE WHEN c.resolved = 0 AND c.parent_id IS NULL THEN 1 ELSE 0 END), 0) \
+                     AS unresolved_count, \
                  COALESCE(MAX(c.created_at), b.created_at) AS last_activity_at \
              FROM blueprints b \
              LEFT JOIN comments c ON c.slug = b.slug \
@@ -1751,6 +1766,73 @@ mod schema_tests {
             "parent's flag cleared in the same tx"
         );
         assert_eq!(p.processing_started_at, None);
+    }
+
+    /// `unresolved_count` counts unresolved *threads*, not unresolved rows.
+    ///
+    /// Counting rows made the number unreachable by design: replies are never
+    /// individually resolvable — the reviewer resolves a thread and the UI sends
+    /// that against the top-level comment — so every reply stayed "unresolved"
+    /// forever and a fully reviewed plan still reported work outstanding.
+    /// `blueprint status` could never print a clean blueprint that had replies.
+    #[test]
+    fn unresolved_count_ignores_replies_and_reaches_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("blueprints.db")).unwrap();
+        store
+            .insert_blueprint("s", b"<p>alpha beta gamma</p>", "tok", None)
+            .unwrap();
+
+        let sel = TextQuoteSelector {
+            ty: "TextQuoteSelector".into(),
+            exact: "beta".into(),
+            prefix: None,
+            suffix: None,
+        };
+        let add = |id: &str, parent: Option<&str>| {
+            store
+                .add_comment(
+                    "s",
+                    id,
+                    "tester",
+                    "body",
+                    &sel,
+                    parent,
+                    None,
+                    None,
+                    AuthorRole::Guest,
+                    false,
+                )
+                .unwrap();
+        };
+        add("top", None);
+        add("r1", Some("top"));
+        add("r2", Some("r1")); // a reply to a reply, two levels down
+
+        let summary = || {
+            store
+                .list_blueprint_summaries()
+                .unwrap()
+                .into_iter()
+                .find(|b| b.slug == "s")
+                .expect("summary for s")
+        };
+
+        let before = summary();
+        assert_eq!(before.comment_count, 3, "raw total counts every row");
+        assert_eq!(
+            before.unresolved_count, 1,
+            "one thread outstanding, not one per reply"
+        );
+
+        assert!(store.set_resolved("s", "top", true).unwrap());
+        let after = summary();
+        assert_eq!(after.comment_count, 3, "resolving does not delete anything");
+        assert_eq!(
+            after.unresolved_count, 0,
+            "resolving the thread must clear the count — the replies are not \
+             separately resolvable, so counting them left this permanently > 0"
+        );
     }
 
     /// `list_versions` must read `current` from the blueprints row. Planting an
