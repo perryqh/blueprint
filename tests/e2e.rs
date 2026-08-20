@@ -8,7 +8,7 @@ use common::oauth::{
     MOCK_LOGIN, browser_client, location, login_via_mock, replay_session, session_cookie,
     spawn_auth_daemon_with_store, spawn_mock_github, spawn_with_auth, spawn_with_auth_owner,
 };
-use common::{client, spawn, wait_for_parked_pollers};
+use common::{client, selector, spawn, wait_for_parked_pollers};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1323,6 +1323,97 @@ async fn anonymous_blueprint_writes_are_rejected_when_auth_is_enabled() {
         .await
         .unwrap();
     assert_eq!(phantom.status(), 404);
+}
+
+/// `unresolved_count` counts unresolved *threads*, asserted over the wire because
+/// the summary is exactly what `blueprint status` prints — the number a human
+/// reads is the point of it being right.
+///
+/// The old query counted rows, and replies are never individually resolvable, so
+/// a reviewed thread stayed permanently "unresolved" and a blueprint with any
+/// replies could never report clean.
+#[tokio::test]
+async fn summary_unresolved_count_tracks_threads_not_reply_rows() {
+    let s = spawn().await;
+    let http = client();
+
+    let r = http
+        .post(format!("{}/api/blueprints", s.base))
+        .json(&json!({ "html": "<p>the plan</p>", "slug": "counts" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let top: Value = http
+        .post(format!("{}/api/blueprints/counts/comments", s.base))
+        .json(&json!({ "author": "t", "body": "top", "selector": selector("plan") }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let top_id = top["id"].as_str().unwrap().to_string();
+
+    // Two replies, the second nested under the first — depth is what made the
+    // old count grow without bound.
+    let mut parent = top_id.clone();
+    for body in ["r1", "r2"] {
+        let reply: Value = http
+            .post(format!(
+                "{}/api/blueprints/counts/comments/{parent}/replies",
+                s.base
+            ))
+            .json(&json!({ "author": "t", "body": body }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        parent = reply["id"].as_str().unwrap().to_string();
+    }
+
+    let summary = async || -> Value {
+        let all: Vec<Value> = client()
+            .get(format!("{}/api/blueprints", s.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        all.into_iter()
+            .find(|b| b["slug"] == "counts")
+            .expect("summary for counts")
+    };
+
+    let before = summary().await;
+    assert_eq!(before["comment_count"], 3);
+    assert_eq!(
+        before["unresolved_count"], 1,
+        "one thread outstanding, not one per reply"
+    );
+
+    let r = http
+        .post(format!(
+            "{}/api/blueprints/counts/comments/{top_id}/resolve",
+            s.base
+        ))
+        .json(&json!({ "resolved": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204, "resolve is a no-content write");
+
+    let after = summary().await;
+    assert_eq!(after["comment_count"], 3, "nothing was deleted");
+    assert_eq!(
+        after["unresolved_count"], 0,
+        "a reviewed thread must report zero — otherwise `blueprint status` can \
+         never show a clean blueprint that has replies"
+    );
 }
 
 /// The reviewer resolves anchors through a wasm module embedded from

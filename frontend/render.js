@@ -203,8 +203,8 @@ export function groupComments(allComments, { showResolved }) {
     if (!byQuote.has(k)) byQuote.set(k, []);
     byQuote.get(k).push(c);
   }
-  // Partition top-level threads by whether their head comment is resolved.
-  // A thread is "resolved" iff its first top-level comment has resolved=true.
+  // Partition groups by whether every thread in them is resolved. See
+  // `isThreadResolved` for why "every" and not "the first".
   const visibleQuotes = [];
   let resolvedCount = 0;
   for (const [quote, cs] of byQuote) {
@@ -217,8 +217,21 @@ export function groupComments(allComments, { showResolved }) {
   return { byParent, byQuote, visibleQuotes, resolvedCount };
 }
 
+// Is this whole group resolved? `cs` is every top-level comment sharing one
+// quote — usually exactly one, but two reviewers can comment on the same
+// sentence, or one reviewer can twice.
+//
+// The unit of resolution is the *thread* (a top-level comment plus its reply
+// subtree), which is the daemon's definition and what `unresolved_count`
+// counts. A group is therefore resolved only when all of its threads are.
+//
+// This used to read `cs[0].resolved`, which had the group inherit its head's
+// state: resolving the first comment on a sentence hid every other comment on
+// that same sentence, unresolved ones included, and with "show resolved" off
+// they were simply gone from the sidebar. It also disagreed with the count the
+// daemon reports, which is the disagreement this whole change exists to remove.
 export function isThreadResolved(cs) {
-  return cs.length > 0 && cs[0].resolved;
+  return cs.length > 0 && cs.every(c => c.resolved);
 }
 
 // Build one thread group. The quote bar is a real <button> so collapse/expand
