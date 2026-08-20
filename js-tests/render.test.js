@@ -109,10 +109,29 @@ describe('groupComments', () => {
     expect(shown.resolvedCount).toBe(1);
   });
 
-  it('treats a thread as resolved based on its head comment only', () => {
-    expect(isThreadResolved([comment({ resolved: true }), comment({ resolved: false })])).toBe(true);
+  // Changed deliberately: this used to assert `cs[0].resolved`, so a group
+  // inherited its head's state. Two comments on the same sentence is ordinary,
+  // and under the old rule resolving the first hid the second — unresolved and
+  // invisible with "show resolved" off. It also disagreed with the daemon's
+  // `unresolved_count`, which counts every unresolved top-level comment.
+  it('treats a group as resolved only when every thread in it is resolved', () => {
+    expect(isThreadResolved([comment({ resolved: true }), comment({ resolved: false })])).toBe(false);
     expect(isThreadResolved([comment({ resolved: false }), comment({ resolved: true })])).toBe(false);
+    expect(isThreadResolved([comment({ resolved: true }), comment({ resolved: true })])).toBe(true);
+    expect(isThreadResolved([comment({ resolved: true })])).toBe(true);
     expect(isThreadResolved([])).toBe(false);
+  });
+
+  // The consequence, at the level the reviewer actually sees: an unresolved
+  // comment must never be hidden by a resolved neighbour on the same quote.
+  it('keeps a group visible while any of its threads is unresolved', () => {
+    const all = [
+      comment({ id: 'a', selector: { exact: 'shared' }, resolved: true }),
+      comment({ id: 'b', selector: { exact: 'shared' }, resolved: false }),
+    ];
+    const hidden = groupComments(all, { showResolved: false });
+    expect(hidden.visibleQuotes.map(([q]) => q)).toEqual(['shared']);
+    expect(hidden.resolvedCount).toBe(0);
   });
 });
 

@@ -145,6 +145,8 @@ blueprint unpublish <slug>                       # daemon stops when no blueprin
 
 **Threaded comments with collapse.** Replies render nested under their parent at arbitrary depth. Each thread can be collapsed via the quote bar (showing a "N messages" badge); a sidebar header offers **Collapse all** / **Expand all**. Collapse state persists in `localStorage` per-slug.
 
+**Resolution.** A **thread** is a top-level comment plus its reply subtree, and it is resolved iff that top-level comment is — replies are never resolvable on their own. Resolve/reopen from the thread's action row or with `r` on the focused thread; resolved threads hide behind a **Show resolved** toggle that persists per-slug. `unresolved_count`, on `GET /api/blueprints` and in `blueprint status`, counts unresolved threads by that same definition, so a fully reviewed plan reports zero.
+
 **Batch comment submission.** The reviewer stages drafts in a sidebar panel and clicks **Submit all** once. One POST → one broadcast event → one agent wake-up, instead of N noisy round-trips.
 
 **Update banner, not auto-reload.** When the blueprint is `--update`d, the `blueprint_version` bumps. The frontend polls every 1.5s and, on version change, shows a "Blueprint updated" banner with **Refresh** and **Dismiss** buttons — reviewers keep their scroll position and refresh on their own terms.
@@ -166,7 +168,7 @@ The CLI is a thin wrapper over a REST API at `http://127.0.0.1:7321`:
 | Method   | Path                                                | Notes                                                                      |
 | -------- | --------------------------------------------------- | -------------------------------------------------------------------------- |
 | `POST`   | `/api/blueprints`                                   | `{ "html": "...", "slug": "optional" }` → `{ slug, url }`                  |
-| `GET`    | `/api/blueprints`                                   | List with `comment_count`, `unresolved_count`, `last_activity_at`          |
+| `GET`    | `/api/blueprints`                                   | List with `comment_count` (all rows), `unresolved_count` (threads), `last_activity_at` |
 | `PUT`    | `/api/blueprints/:slug`                             | `{ "html": "..." }` — replace HTML, bump `blueprint_version`               |
 | `GET`    | `/api/blueprints/:slug/raw`                         | Raw uploaded HTML (served into the iframe), `no-store`                     |
 | `GET`    | `/api/blueprints/:slug/comments?since=ts`           | `{ comments, server_ts, blueprint_version }`                               |
@@ -245,7 +247,6 @@ See `.rusty-hook.toml`. To bypass for an emergency commit: `git commit --no-veri
 - **Cross-machine sharing.** Run an SSH tunnel if you need it before Phase 1.
 - **Multi-version diffing.** `--update` replaces the HTML; old comments either re-anchor, render as "refresh to see," or drift.
 - **Realtime collab via SSE / WebSockets.** 1.5s polling for the sidebar; long-poll for `wait` and `wait-comment`. No fan-out streaming.
-- **Resolve workflow UI.** Comments have a `resolved` column but no UI affordance.
 - **Slack / email notifications.** `blueprint watch` and `blueprint watch --stream` are the only "tell me when something happens" surfaces.
 - **XDG-compliant data dir.** SQLite lives at `~/.blueprint/blueprints.db` regardless of `$XDG_DATA_HOME`.
 
