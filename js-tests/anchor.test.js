@@ -1,15 +1,16 @@
-// Table-driven tests for the text-anchoring algorithm (frontend/anchor.js).
+// Tests for the text-anchoring algorithm (frontend/anchor.js).
 //
 // Anchoring is the load-bearing piece of the whole product: get it wrong and a
 // comment either lands on the wrong paragraph or is reported as "drifted" when
-// the text is plainly still there. It had zero coverage in either language
-// before this file.
+// the text is plainly still there.
 //
-// `findQuoteIndex` is tested directly on strings (it's pure), and
-// `highlightQuote` is tested against real jsdom documents so the text-node
-// walking and Range construction are exercised too.
+// `findQuoteIndex` is driven from a case table in vectors/anchor-cases.json —
+// data rather than code, so the cases read as a spec. `highlightQuote` is tested
+// against real jsdom documents so the text-node walking and Range construction
+// are exercised too.
 
 import { describe, expect, it } from 'vitest';
+import corpus from './vectors/anchor-cases.json';
 import {
   findQuoteIndex,
   highlightQuote,
@@ -17,6 +18,8 @@ import {
   textBefore,
   captureSelector,
 } from '../frontend/anchor.js';
+
+const cases = corpus.cases;
 
 // Build a document whose body is `html`. jsdom is the environment (see
 // vitest.config.js), so `document.implementation` gives us isolated docs that
@@ -42,143 +45,54 @@ function highlightedText(doc) {
 }
 
 describe('findQuoteIndex', () => {
-  // Each case: the haystack, the selector, and the offset we expect to win.
-  const cases = [
-    {
-      name: 'unique quote — context is redundant but must not break the match',
-      text: 'alpha beta gamma',
-      selector: { exact: 'beta', prefix: 'alpha ', suffix: ' gamma' },
-      expected: 6,
-    },
-    {
-      name: 'unique quote with no context at all',
-      text: 'alpha beta gamma',
-      selector: { exact: 'beta' },
-      expected: 6,
-    },
-    {
-      name: 'duplicate quotes — prefix disambiguates to the second',
-      text: 'the cat sat. the dog sat. done',
-      selector: { exact: 'sat', prefix: 'the dog ' },
-      expected: 21,
-    },
-    {
-      name: 'duplicate quotes — suffix disambiguates to the second',
-      text: 'x: value one. x: value two.',
-      selector: { exact: 'x: value', suffix: ' two.' },
-      expected: 14,
-    },
-    {
-      name: 'duplicate quotes — prefix+suffix together pick the middle one',
-      text: 'a ref b. c ref d. e ref f.',
-      selector: { exact: 'ref', prefix: 'c ', suffix: ' d.' },
-      expected: 11,
-    },
-    {
-      name: 'prefix longer than the 32-char window still matches on its tail',
-      // Only the last 32 chars of the prefix are compared, because that's all
-      // `captureSelector` recorded and all the haystack slice provides.
-      text: 'x'.repeat(50) + 'TARGET tail',
-      selector: { exact: 'TARGET', prefix: 'y'.repeat(20) + 'x'.repeat(32) },
-      expected: 50,
-    },
-    {
-      name: 'no match — quote is simply gone',
-      text: 'nothing to see here',
-      selector: { exact: 'absent', prefix: 'no', suffix: 'pe' },
-      expected: -1,
-    },
-  ];
+  // Cases come from vectors/anchor-cases.json. Keeping them as data means the
+  // table reads as a specification of the algorithm — including the offsets it
+  // gets deliberately wrong — instead of being buried in assertion syntax, and
+  // a new case costs one JSON object rather than a new test.
+  it.each(cases.map(c => [c.name, c]))('%s', (_name, c) => {
+    expect(findQuoteIndex(c.text, sel(c), c.exact)).toBe(c.index ?? -1);
+  });
 
-  for (const c of cases) {
-    it(c.name, () => {
-      expect(findQuoteIndex(c.text, sel(c.selector), c.selector.exact)).toBe(c.expected);
-    });
-  }
+  it('covers the whole corpus', () => {
+    // Guards against `it.each` silently receiving an empty array. A
+    // table-driven suite whose table failed to load reports success while
+    // testing nothing, which is worse than having no suite.
+    expect(cases.length).toBeGreaterThanOrEqual(25);
+  });
 
-  // KNOWN-WRONG BEHAVIOUR, asserted deliberately so a future change is visible.
+  // Two things the case table cannot carry, kept here as hand-written cases.
+
+  // JSON cannot hold an unpaired surrogate, so this one only exists in code.
   //
-  // When several occurrences exist and *none* of them agrees with the recorded
-  // prefix/suffix (e.g. the plan was edited around the quote), the loop falls
-  // through and `return text.indexOf(quote)` hands back the FIRST occurrence.
-  // That is very likely the wrong one — the user's comment was anchored to some
-  // other instance. The alternative (returning -1 and flagging drift) was judged
-  // worse in practice, so the wrong-but-visible anchor is intentional. If this
-  // test starts failing, someone changed that trade-off on purpose.
-  it('duplicate quotes with FAILING disambiguation falls back to the first hit (known-wrong)', () => {
-    const text = 'one HIT two HIT three HIT four';
-    // Context that matches none of the three occurrences.
-    const s = sel({ exact: 'HIT', prefix: 'ZZZZ ', suffix: ' QQQQ' });
-    expect(findQuoteIndex(text, s, 'HIT')).toBe(4); // first occurrence
-    // For contrast: correct disambiguation would have picked the third.
-    expect(text.indexOf('HIT', 18)).toBe(22);
+  // Getting a real split takes care, and the version of this test that shipped
+  // before did not manage it: a 32-unit window over 2-unit emoji always lands on
+  // a pair boundary, because both are even. `'z' + 16 emoji` yields a perfectly
+  // well-formed prefix, so the old assertion passed without exercising the case
+  // it described. A split needs an odd count of 1-unit characters after the run —
+  // 20 emoji plus `'a'` puts the cut at offset 9, inside emoji #5.
+  it('a prefix starting on a lone surrogate still anchors', () => {
+    const text = '🎯'.repeat(20) + 'aTARGET';
+    const start = text.indexOf('TARGET');
+    expect(start).toBe(41);
+    const recorded = text.slice(0, start).slice(-32);
+    expect(recorded.length).toBe(32);
+    // Assert the premise, so this can't quietly stop testing what it claims.
+    const first = recorded.charCodeAt(0);
+    expect(first).toBeGreaterThanOrEqual(0xDC00);
+    expect(first).toBeLessThanOrEqual(0xDFFF);
+    expect(findQuoteIndex(text, sel({ exact: 'TARGET', prefix: recorded }), 'TARGET'))
+      .toBe(start);
   });
 
-  // The Rust test harness (tests/e2e.rs, tests/concurrent.rs) builds nearly
-  // every selector as {type, exact} with no context, and src/selector.rs uses
-  // `skip_serializing_if = "Option::is_none"` so the fields come back *absent*
-  // rather than empty. Either way `!selector.prefix` is truthy and
-  // disambiguation is skipped entirely — so the whole prefix/suffix branch that
-  // this algorithm exists for is never exercised by the Rust suite.
-  it('empty-string prefix disables prefix disambiguation (so first hit wins)', () => {
-    const text = 'aa ZZ bb ZZ cc';
-    // A selection at offset 0 legitimately has prefix '', which is falsy — the
-    // same code path as "no prefix recorded".
-    const s = sel({ exact: 'ZZ', prefix: '', suffix: ' bb' });
-    expect(findQuoteIndex(text, s, 'ZZ')).toBe(3);
-    // Suffix alone still works; it's only the empty field that opts out.
-    const s2 = sel({ exact: 'ZZ', prefix: '', suffix: ' cc' });
-    expect(findQuoteIndex(text, s2, 'ZZ')).toBe(9);
-  });
-
-  it('undefined prefix (server omitted it) behaves the same as empty', () => {
-    const text = 'aa ZZ bb ZZ cc';
-    const s = sel({ exact: 'ZZ', suffix: ' cc' });
-    expect(s.prefix).toBeUndefined();
-    expect(findQuoteIndex(text, s, 'ZZ')).toBe(9);
-  });
-
-  // Multi-byte characters make the 32-char context window a *code-unit* window,
-  // not a character one: JS string indices are UTF-16 code units, so an emoji
-  // (surrogate pair) counts as 2 and can be sliced in half at the boundary.
-  describe('multi-byte characters near the 32-char window edge', () => {
-    it('astral-plane prefix is compared by code units and still matches', () => {
-      // 16 emoji = 32 UTF-16 code units, exactly filling the window.
-      const emoji = '🎯'.repeat(16);
-      const text = `lead ${emoji}TARGET trail`;
-      const start = text.indexOf('TARGET');
-      const fullPrefix = text.slice(0, start);
-      expect(fullPrefix.length).toBeGreaterThan(32);
-      // captureSelector would have recorded only the last 32 code units.
-      const recorded = fullPrefix.slice(-32);
-      expect(findQuoteIndex(text, sel({ exact: 'TARGET', prefix: recorded }), 'TARGET'))
-        .toBe(start);
-    });
-
-    it('a surrogate pair split by the window edge still anchors', () => {
-      // 33 code units of prefix means the 32-unit window starts mid-emoji,
-      // leaving a lone low surrogate at the front of both the recorded prefix
-      // and the haystack slice. They're compared as equal code units, so
-      // endsWith still succeeds — the match must not be lost to mojibake.
-      const text = 'z' + '🎯'.repeat(16) + 'TARGET';
-      const start = text.indexOf('TARGET');
-      expect(start).toBe(33);
-      const recorded = text.slice(0, start).slice(-32);
-      expect(recorded.length).toBe(32);
-      expect(findQuoteIndex(text, sel({ exact: 'TARGET', prefix: recorded }), 'TARGET'))
-        .toBe(start);
-    });
-
-    it('combining marks are matched as written, not normalized', () => {
-      // 'é' as e + U+0301 is two code units and does NOT equal precomposed 'é'.
-      // The algorithm does no Unicode normalization, so a selector recorded in
-      // one form won't match text stored in the other. Asserted so the
-      // limitation is documented rather than discovered.
-      const decomposed = 'café menu';
-      const precomposed = 'café menu';
-      expect(findQuoteIndex(decomposed, sel({ exact: 'café' }), 'café')).toBe(-1);
-      expect(findQuoteIndex(precomposed, sel({ exact: 'café' }), 'café')).toBe(0);
-    });
+  // The table asserts that an empty quote resolves to nothing. What it cannot
+  // assert is that the call *terminates*: `indexOf('', n)` clamps to `length`
+  // instead of returning -1, so without the guard the scan cursor stops
+  // advancing the result and the loop hangs the tab. The timeout turns that into
+  // a legible failure rather than a wedged test run.
+  it('an empty quote returns -1 rather than spinning forever', { timeout: 1000 }, () => {
+    expect(findQuoteIndex('any text at all', sel({ exact: '', prefix: 'ZZZZ' }), '')).toBe(-1);
+    expect(findQuoteIndex('any text at all', sel({ exact: '' }), '')).toBe(-1);
+    expect(findQuoteIndex('', sel({ exact: '' }), '')).toBe(-1);
   });
 });
 
@@ -244,8 +158,8 @@ describe('captureSelector', () => {
     range.setStart(textNode, 0);
     range.setEnd(textNode, 5);
     const fakeSel = { getRangeAt: () => range, toString: () => 'start' };
-    // This is the '' case above: real, reachable, and it silently turns off
-    // prefix disambiguation for the resulting selector.
+    // Real, reachable, and it silently turns off prefix disambiguation for the
+    // resulting selector — the corpus has the cases for what that then does.
     expect(captureSelector(fakeSel, doc.body).prefix).toBe('');
   });
 });
@@ -303,6 +217,17 @@ describe('highlightQuote', () => {
     const span = doc.querySelector('span[data-ps-hl]');
     // The highlighted "sat" must be the one after "dog", not after "cat".
     expect(span.previousSibling.textContent.endsWith('the dog ')).toBe(true);
+  });
+
+  // Astral-plane text end to end through the DOM path: the offsets the resolver
+  // returns are UTF-16 code units, which is what the TreeWalker's
+  // `textContent.length` arithmetic counts. An implementation using bytes or
+  // code points would return a plausible number and highlight the wrong span.
+  it('anchors correctly when the document contains emoji before the quote', () => {
+    const doc = docFrom('<p>🎯🎯🎯 aim at TARGET now</p>');
+    expect(highlightQuote(doc, sel({ exact: 'TARGET', prefix: 'aim at ' }), 'TARGET')).toBe(true);
+    expect(highlightedText(doc)).toBe('TARGET');
+    expect(wholeText(doc.body)).toBe('🎯🎯🎯 aim at TARGET now');
   });
 
   it('invokes onClick with the quote when a highlight is activated', () => {

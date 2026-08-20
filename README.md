@@ -139,7 +139,9 @@ blueprint unpublish <slug>                       # daemon stops when no blueprin
 
 **Daemon.** Runs on `127.0.0.1:7321` by default. Lock file at `~/.blueprint/daemon.lock` records PID + port. Any CLI subcommand reuses a live daemon or spawns a detached child. The lock file is PID-scoped, so a graceful shutdown of an old daemon can't clobber a replacement's lock during handoff.
 
-**Anchoring.** Comments store a [TextQuoteSelector](https://www.w3.org/TR/annotation-model/#text-quote-selector) — `exact` text plus ~32 chars of `prefix` and `suffix`. The browser walks the iframe's text nodes, finds the first occurrence whose context matches, wraps the range in a `<span data-ps-hl>`, and binds a click handler that scrolls the matching comment group in the sidebar. If `exact` no longer appears, the comment renders as **drifted** (yellow badge).
+**Anchoring.** Comments store a [TextQuoteSelector](https://www.w3.org/TR/annotation-model/#text-quote-selector) — `exact` text plus 32 **UTF-16 code units** of `prefix` and `suffix`. (Code units, not characters: an emoji counts as two, so the window can bisect one. Half the case table exists to pin that.) The browser walks the iframe's text nodes, finds the first occurrence whose context matches, wraps the range in a `<span data-ps-hl>`, and binds a click handler that scrolls the matching comment group in the sidebar. If `exact` no longer appears, the comment renders as **drifted** (yellow badge).
+
+When no occurrence matches the recorded context — the text around the quote was edited — resolution falls back to the *first* occurrence rather than reporting drift. That is deliberate and known-wrong: the comment lands on text the reviewer probably didn't select, but reporting drift on text that is plainly still present tested worse. The case table records it as such.
 
 **Bidirectional click-to-scroll.** Click a highlighted span → sidebar group flashes blue. Click a sidebar group's body → the highlight in the iframe pulses. Inputs/buttons inside the group are excluded so reply forms still work.
 
@@ -230,7 +232,9 @@ npm test      # frontend ES modules, via vitest
 
 Rust covers: publish → comment → reply → finish → fetch → update → drift → unpublish; random-slug generation; empty-HTML / empty-body / unknown-parent rejection; the `GET /api/blueprints` summary shape; `wait-comment` fast-path and slow-path; OAuth round-trip against a mock GitHub; CLI bearer-token write-auth and the blueprint write gate in both directions; multi-repo concurrency (`shutdown-if-empty`, `X-Client-Cwd`); the batch endpoint (atomicity, single wake-up); schema migrations; and a CLI subprocess smoke test.
 
-JS covers the four frontend modules with real behaviour, not smoke tests: the anchoring algorithm (including the known-wrong first-`indexOf` fallback, quotes spanning inline markup, and a surrogate pair split by the context window), poll backoff and the disconnect banner, draft storage, and rendering.
+JS covers the four frontend modules with real behaviour, not smoke tests: the anchoring algorithm, poll backoff and the disconnect banner, draft storage, and rendering.
+
+Anchoring's cases live in `js-tests/vectors/anchor-cases.json` — data rather than code, so they read as a specification of what the algorithm does, including the offsets it gets deliberately wrong. Two cases can't be expressed as JSON and stay hand-written next to it: a prefix beginning on an unpaired surrogate (JSON can't carry one), and the empty quote, where what needs asserting is that the call *terminates*.
 
 Not covered by either suite: click-to-scroll and collapse interactions in a live browser (manual verification only).
 

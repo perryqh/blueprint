@@ -105,7 +105,18 @@ export function highlightQuote(doc, selector, quote, onClick) {
 // which covers `undefined` (the server omits absent context via
 // skip_serializing_if) and `''` (a selection at the very start of the document
 // has no prefix). Either way disambiguation is off and the first hit wins.
+//
+// The cases this is expected to satisfy live in
+// `js-tests/vectors/anchor-cases.json`, including the ones it gets deliberately
+// wrong.
 export function findQuoteIndex(text, selector, quote) {
+  // An empty quote is unanchorable, and returning early is load-bearing rather
+  // than defensive: `indexOf('', n)` clamps to `length` instead of returning -1,
+  // so once the scan passes the end of the string the `searchFrom = found + 1`
+  // cursor stops advancing the *result* and this loop spins forever — freezing
+  // the tab. The daemon does not reject `exact: ""`, so a hand-rolled comment
+  // reaches it. Nothing can usefully anchor to a zero-length quote anyway.
+  if (!quote) return -1;
   let searchFrom = 0;
   while (true) {
     const found = text.indexOf(quote, searchFrom);
