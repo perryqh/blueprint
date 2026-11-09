@@ -1,0 +1,87 @@
+name: Release
+
+# Cut a GitHub Release with platform binaries when a version tag is pushed.
+# Frontend assets are embedded at compile time via rust-embed (see
+# src/server.rs); there is no separate Node build step to run here.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: blueprint-x86_64-unknown-linux-gnu.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: blueprint-aarch64-apple-darwin.tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: blueprint-x86_64-apple-darwin.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel and lists these targets; rustup
+      # installs rustfmt/clippy too, which we don't need for release builds
+      # but keeps the pin identical to CI.
+      - name: Install toolchain for target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/blueprint"
+          staging="blueprint-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "$bin" "$staging/blueprint"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar -czf "${{ matrix.artifact }}" "$staging"
+          ls -la "${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: github-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
