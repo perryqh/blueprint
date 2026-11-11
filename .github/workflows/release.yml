@@ -8,21 +8,55 @@ on:
     tags:
       - "v*"
 
+# Read-only by default; only the `release` job below gets write access.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Gate the release on the tagged commit itself: the tag must match the
+  # crate version, and the same checks rust.yml runs on main must pass. A tag
+  # pushed on an untested or un-bumped commit fails here, before any binary
+  # is built.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --locked
+
   build:
     name: build (${{ matrix.target }})
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Built on the oldest supported Ubuntu runner so the binary's glibc
+          # floor (2.35) covers Debian 12, RHEL 9, and Ubuntu 22.04+, not just
+          # whatever ubuntu-latest ships.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: blueprint-x86_64-unknown-linux-gnu.tar.gz
           - os: macos-latest
@@ -35,12 +69,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins the channel and lists these targets; rustup
-      # installs rustfmt/clippy too, which we don't need for release builds
-      # but keeps the pin identical to CI.
-      - name: Install toolchain for target
-        run: rustup target add ${{ matrix.target }}
-
+      # No toolchain step: rust-toolchain.toml pins the channel and lists all
+      # three targets, so the first cargo invocation installs both.
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -66,6 +96,8 @@ jobs:
     name: github-release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -77,10 +109,14 @@ jobs:
       - name: List artifacts
         run: ls -la dist/
 
+      # Pinned to a commit SHA rather than the movable `v2` tag: this is a
+      # third-party action running with `contents: write`.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           draft: false
+          # Tags like v0.3.0-rc1 publish as prereleases, not as "Latest".
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: dist/*
         env:
