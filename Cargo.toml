@@ -1,8 +1,12 @@
 [package]
 name = "blueprint"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Share interactive HTML blueprints with inline anchored comments"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/perryqh/blueprint"
+homepage = "https://github.com/perryqh/blueprint"
+readme = "README.md"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
@@ -27,7 +31,10 @@ anyhow = "1"
 thiserror = "1"
 dirs = "5"
 mime_guess = "2"
-reqwest = { version = "0.12", features = ["json"] }
+# rustls rather than reqwest's default native-tls: native-tls links the
+# system OpenSSL on Linux, so release binaries would need a matching
+# libssl.so at runtime. oauth2 below already uses rustls.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
@@ -46,7 +53,7 @@ parking_lot = "0.12"
 tempfile = "3"
 rusty-hook = "0.11"
 # Only the integration tests drive a browser-shaped client with a cookie jar.
-reqwest = { version = "0.12", features = ["json", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls", "charset", "http2"] }
 
 [profile.release]
 lto = "thin"

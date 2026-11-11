@@ -1,0 +1,123 @@
+name: Release
+
+# Cut a GitHub Release with platform binaries when a version tag is pushed.
+# Frontend assets are embedded at compile time via rust-embed (see
+# src/server.rs); there is no separate Node build step to run here.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Read-only by default; only the `release` job below gets write access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate the release on the tagged commit itself: the tag must match the
+  # crate version, and the same checks rust.yml runs on main must pass. A tag
+  # pushed on an untested or un-bumped commit fails here, before any binary
+  # is built.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --locked
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest supported Ubuntu runner so the binary's glibc
+          # floor (2.35) covers Debian 12, RHEL 9, and Ubuntu 22.04+, not just
+          # whatever ubuntu-latest ships.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: blueprint-x86_64-unknown-linux-gnu.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: blueprint-aarch64-apple-darwin.tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: blueprint-x86_64-apple-darwin.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain step: rust-toolchain.toml pins the channel and lists all
+      # three targets, so the first cargo invocation installs both.
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/blueprint"
+          staging="blueprint-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "$bin" "$staging/blueprint"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar -czf "${{ matrix.artifact }}" "$staging"
+          ls -la "${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: github-release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      # Pinned to a commit SHA rather than the movable `v2` tag: this is a
+      # third-party action running with `contents: write`.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          draft: false
+          # Tags like v0.3.0-rc1 publish as prereleases, not as "Latest".
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
