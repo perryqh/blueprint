@@ -60,9 +60,8 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement via a GitHub
-issue on this repository (or by contacting the maintainer privately once a
-dedicated contact address is published here — **TODO: replace this placeholder
-with a maintainer email**). All complaints will be reviewed and investigated
+issue on this repository, or privately to the maintainer through the contact
+details on their GitHub profile, [@perryqh](https://github.com/perryqh). All complaints will be reviewed and investigated
 promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the

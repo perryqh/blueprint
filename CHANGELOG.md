@@ -28,12 +28,17 @@ toward an open-source launch.
   `cargo test`, and the Vitest job.
 - Dual MIT OR Apache-2.0 licensing, Contributor Covenant 2.1, and CONTRIBUTING.
 - GitHub Actions release workflow that attaches Linux x86_64 and macOS
-  (arm64 + x86_64) binaries on `v*` tags.
+  (arm64 + x86_64) binaries on `v*` tags. It refuses a tag that doesn't match
+  `Cargo.toml`, re-runs fmt/clippy/tests before building, and publishes
+  `-rc`-style tags as prereleases.
 
 ### Changed
 
 - README led with trust/provenance positioning and an honest comparison to
   crit and Plannotator; long setup and OAuth detail moved to `docs/`.
+- HTTP client switched from native-tls to rustls, so the Linux release binary
+  no longer needs a system OpenSSL (`libssl.so`) at runtime. It is built on
+  Ubuntu 22.04 for a glibc 2.35 floor.
 
 ### Fixed
 
@@ -45,3 +50,5 @@ toward an open-source launch.
 
 Initial commit through early branding and README — never tagged. Treat 0.2.0
 as the first public version line.
+
+[0.2.0]: https://github.com/perryqh/blueprint/releases/tag/v0.2.0

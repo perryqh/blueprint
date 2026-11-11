@@ -151,7 +151,7 @@ instead of N noisy round-trips.
 
 **Update banner, not auto-reload.** When the blueprint is `--update`d, the
 `blueprint_version` bumps. The frontend polls every 1.5s and, on version change,
-shows a "Blueprint updated" banner with **Refresh** and **Dismiss** buttons —
+shows a "Plan updated" banner with **Refresh** and **Dismiss** buttons —
 reviewers keep their scroll position and refresh on their own terms.
 
 **Live monitoring for agents.** `blueprint watch <slug> --stream` long-polls
@@ -249,10 +249,14 @@ blueprint/
 ├── integrations/
 │   └── claude-code/skills/blueprint/SKILL.md
 └── tests/
+    ├── common/                  # shared harness (in-process daemon, mock GitHub OAuth)
     ├── e2e.rs                   # in-process daemon, HTTP-level e2e
     ├── concurrent.rs            # multi-repo + batch endpoint
     ├── cli_smoke.rs             # spawns the binary, round-trips publish/status/unpublish
-    └── no_legacy_references.rs  # safety net for the rename — fails on stale strings
+    ├── finish.rs                # durable Finish Review latch
+    ├── mcp.rs                   # stdio MCP server conformance over the real binary
+    ├── security.rs              # CSP sandbox on /raw, body cap, long-poll ceiling
+    └── versioning.rs            # version history + version-pinned comments
 ```
 
 Stack: `axum`, `tokio`, `rusqlite` (bundled), `nix` (flock), `serde`, `clap`,

@@ -40,11 +40,22 @@ different WARN noting that no comment will trip a plan edit.
 
 ## Callback URL and port
 
-The registered OAuth app's callback URL is
-`http://127.0.0.1:7321/auth/github/callback`, so the daemon **must** bind port
-7321 for the round-trip to work. That's the default; don't override unless you
-also re-register the OAuth app. To drop back to anonymous mode, delete
-`~/.blueprint/env` (or unset the two `GITHUB_*` vars) and restart the daemon.
+The daemon's default callback URL is
+`http://127.0.0.1:7321/auth/github/callback`, and it must match the callback
+registered on your GitHub OAuth app exactly. So with the defaults, the daemon
+has to bind port 7321 for the round-trip to work.
+
+To run on another port, change all three together: bind the new port
+(`--port` / `BLUEPRINT_PORT`), set `OAUTH_CALLBACK_URL` in `~/.blueprint/env`
+to match, and update the callback URL on the GitHub OAuth app:
+
+```ini
+# ~/.blueprint/env
+OAUTH_CALLBACK_URL=http://127.0.0.1:7400/auth/github/callback
+```
+
+To drop back to anonymous mode, delete `~/.blueprint/env` (or unset the two
+`GITHUB_*` vars) and restart the daemon.
 
 ## How the write gate interacts
 

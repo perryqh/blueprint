@@ -38,10 +38,11 @@ npm ci
 npx vitest run
 # equivalent: npm test
 
-# Rename safety net — fails if a stale pre-rename project name reappears.
-# Mirror of the "No stale plan" + "share" check in .github/workflows/rust.yml:
-# git grep for the old hyphenated / underscored / SCREAMING forms across
-# *.rs *.toml *.md *.js *.html *.css *.json (excluding Cargo.lock).
+# Rename safety net — local equivalent of the stale-name step in rust.yml
+# (bracket regex so this file doesn't match itself). Exits 1 with no output
+# when clean; any output is a stale reference to drop or rename.
+git grep -In -i -e 'plan[-_]share' \
+  -- '*.rs' '*.toml' '*.md' '*.js' '*.html' '*.css' '*.json' ':!Cargo.lock'
 ```
 
 A [`rusty-hook`](https://github.com/swellaby/rusty-hook) pre-commit hook is
@@ -64,8 +65,12 @@ See [`.rusty-hook.toml`](.rusty-hook.toml). Bypass for an emergency commit with
   `js-tests/` and runs through Vitest.
 - Update the README or `docs/` when you change user-facing behavior (CLI flags,
   env vars, HTTP endpoints, OAuth).
-- Do not bump the crate version or cut a release tag in a feature PR; version
-  bumps ride with the release workflow on `v*` tags.
+- Do not bump the crate version or cut a release tag in a feature PR. Releases
+  are manual: a dedicated PR bumps `version` in `Cargo.toml` and adds the
+  `CHANGELOG.md` entry, then a `vX.Y.Z` tag on the merged commit triggers
+  `.github/workflows/release.yml`. That workflow refuses a tag that doesn't
+  match `Cargo.toml`, re-runs fmt/clippy/tests, and only then builds binaries.
+  It does not bump anything itself.
 - Describe *what* changed and *why* in the PR body. Link any related issue.
 
 ## License

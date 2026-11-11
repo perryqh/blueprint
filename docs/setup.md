@@ -53,8 +53,8 @@ blueprint unpublish <slug>                      # daemon auto-stops when no blue
 
 If the publish step prints a `127.0.0.1:7321` URL and the page renders with a
 sidebar, you're wired up. If port 7321 is already in use, `lsof -i :7321` to
-find the squatter — or pass `--port` / set `BLUEPRINT_PORT` (OAuth login won't
-work on a different port; see [oauth.md](oauth.md)).
+find the squatter — or pass `--port` / set `BLUEPRINT_PORT` (OAuth login on a different port also needs `OAUTH_CALLBACK_URL` and the
+OAuth app's callback updated; see [oauth.md](oauth.md)).
 
 ## 5. Install the Claude Code skill
 
